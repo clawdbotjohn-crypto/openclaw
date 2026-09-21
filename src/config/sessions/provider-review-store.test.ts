@@ -1,8 +1,11 @@
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import * as admission from "../../infra/sqlite-worker-operation-admission.js";
+import { closeOpenClawAgentDatabaseByPathAsync } from "../../state/openclaw-agent-db-lifecycle.js";
+import { readExistingAgentSchemaMeta } from "../../state/openclaw-agent-db-metadata.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { resolveSessionWorkStartError } from "./lifecycle.js";
 import {
   compareSessionProviderReview,
   readSessionProviderReview,
@@ -28,6 +31,67 @@ const review: SessionProviderReview = {
   runtimeId: "codex",
 };
 const assertCurrent = () => {};
+
+it("reopens an existing session and preserves its provider pause without a schema migration", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const database = openOpenClawAgentDatabase({ agentId: target.agentId });
+    const selectedTarget = { ...target, storePath: database.path };
+    const original = {
+      sessionId: target.sessionId,
+      lifecycleRevision: target.lifecycleRevision,
+      updatedAt: 1,
+      label: "Existing session",
+      lastRunId: "previous-run",
+    };
+    writeSessionEntry(database, target.sessionKey, original);
+    const schema = readExistingAgentSchemaMeta(database.db);
+    expect(schema?.schemaVersion).toEqual(expect.any(Number));
+    await closeOpenClawAgentDatabaseByPathAsync(database.path, target.agentId);
+    expect(database.db.isOpen).toBe(false);
+
+    const existing = await readSessionProviderReview(selectedTarget, assertCurrent);
+    expect(existing).toMatchObject(original);
+    expect(existing?.providerReview).toBeUndefined();
+    expect(
+      resolveSessionWorkStartError(target.sessionKey, existing, {
+        expectedSessionId: target.sessionId,
+      }),
+    ).toBeUndefined();
+
+    const retainedReview: SessionProviderReview = {
+      ...review,
+      api: "openai-chatgpt-responses",
+      nativeThreadId: "review-thread",
+      nativeTurnId: "review-turn",
+      review: {
+        explanation: "Inspect the selected operation.\nKeep the original findings intact.",
+        continuation: { message: "Continue only within the selected project." },
+        errorType: "misalignment_policy_violation",
+      },
+    };
+    await compareSessionProviderReview(selectedTarget, {
+      expectedReview: undefined,
+      nextReview: retainedReview,
+      assertCurrent,
+    });
+    await closeOpenClawAgentDatabaseByPathAsync(database.path, target.agentId);
+
+    const reopened = openOpenClawAgentDatabase({
+      agentId: target.agentId,
+      path: database.path,
+    });
+    expect(reopened.db.isOpen).toBe(true);
+    expect(readExistingAgentSchemaMeta(reopened.db)).toEqual(schema);
+    const persisted = await readSessionProviderReview(selectedTarget, assertCurrent);
+    expect(persisted).toMatchObject(original);
+    expect(persisted?.providerReview).toEqual(retainedReview);
+    expect(
+      resolveSessionWorkStartError(target.sessionKey, persisted, {
+        expectedSessionId: target.sessionId,
+      }),
+    ).toContain("paused as a precaution");
+  });
+});
 
 it.each(["default", "shared"] as const)(
   "keeps %s review reads and exact compare-set off the caller's SQLite thread",
