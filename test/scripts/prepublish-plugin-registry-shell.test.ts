@@ -88,16 +88,21 @@ async function withPublishedRegistry(
   version = BASELINE_VERSION,
 ) {
   const portFile = join(root, "upstream-port");
-  const args = ["openclaw", "@openclaw/ai", "@openclaw/discord", "fixture-dev-only"].flatMap(
-    (name, index) => [
-      name,
-      version,
-      createTarball(root, root, name, `baseline-${index}.tgz`, version, {
-        provenance: "published",
-        ...(name === "openclaw" ? { dependencies: { "@openclaw/ai": version } } : {}),
-      }),
-    ],
-  );
+  const args = [
+    "openclaw",
+    "@openclaw/ai",
+    "@openclaw/codex",
+    "@openclaw/discord",
+    "@openclaw/whatsapp",
+    "fixture-dev-only",
+  ].flatMap((name, index) => [
+    name,
+    version,
+    createTarball(root, root, name, `baseline-${index}.tgz`, version, {
+      provenance: "published",
+      ...(name === "openclaw" ? { dependencies: { "@openclaw/ai": version } } : {}),
+    }),
+  ]);
   const server = spawn(
     process.execPath,
     [resolve("scripts/e2e/lib/plugins/npm-registry-server.mjs"), portFile, ...args],
@@ -330,7 +335,7 @@ exit 17
       const root = tempDirs.make("openclaw-survivor-same-version-");
       const fixture = registryFixture(
         root,
-        ["openclaw", "@openclaw/ai", "@openclaw/discord"],
+        ["openclaw", "@openclaw/ai", "@openclaw/codex", "@openclaw/discord", "@openclaw/whatsapp"],
         BASELINE_VERSION,
       );
       const source = readFileSync("scripts/e2e/lib/upgrade-survivor/run.sh", "utf8");
@@ -354,6 +359,16 @@ exit 17
 set -euo pipefail
 if [ "$1" = --version ]; then
   printf '%s\\n' "$BASELINE_VERSION"
+elif [ "$1" = plugins ]; then
+  test "$2" = install
+  if [ "$3" = --help ]; then
+    printf '%s\\n' 'Usage: openclaw plugins install [options] <spec>' '  --force  Overwrite the installed plugin'
+  else
+    test "$#" = 4
+    test "$4" = --force
+    npm install --prefix "$PLUGIN_INSTALL" "$3" --ignore-scripts --no-fund --no-audit --package-lock=false
+    node -e 'const assert=require("node:assert/strict"); const spec=process.argv[1]; const name=spec.slice(0,spec.lastIndexOf("@")); const pkg=require(process.env.PLUGIN_INSTALL+"/node_modules/"+name+"/package.json"); assert.equal(pkg.provenance,"published"); assert.equal(pkg.version,process.env.BASELINE_VERSION);' "$3"
+  fi
 else
   test "$1" = gateway
   npm install --prefix "$PLUGIN_INSTALL" "@openclaw/discord@$BASELINE_VERSION" --ignore-scripts --no-fund --no-audit --package-lock=false
@@ -373,6 +388,7 @@ fi
             `
 set -euo pipefail
 source "$HELPER"
+source "$INSTANCE_HELPER"
 ${functions}
 source "$MISSING_LOAD_PATH"
 normalize_baseline() { baseline_spec="openclaw@$BASELINE_VERSION"; baseline_version="$BASELINE_VERSION"; baseline_version_expected=1; }
@@ -391,6 +407,7 @@ if [ "$STAGE" = install ]; then
   test "$baseline_version" = "$BASELINE_VERSION"
   node -e 'const assert=require("node:assert/strict"); assert.equal(require(process.env.npm_config_prefix+"/lib/node_modules/openclaw/node_modules/@openclaw/ai/package.json").provenance,"published");'
 else
+  normalize_baseline
   mkdir -p "$ARTIFACT_ROOT/missing-load-path"
   run_missing_load_path_fixture baseline
 fi
@@ -421,6 +438,7 @@ node -e 'const assert=require("node:assert/strict"); for(const name of ["opencla
               PATH: `${bin}:${process.env.PATH}`,
               OPENCLAW_NPM_REGISTRY_UPSTREAM: upstream,
               HELPER: resolve(SCRIPT),
+              INSTANCE_HELPER: resolve("scripts/lib/openclaw-e2e-instance.sh"),
               MISSING_LOAD_PATH: resolve("scripts/e2e/lib/upgrade-survivor/missing-load-path.sh"),
               STAGE: stage,
               BASELINE_VERSION,
