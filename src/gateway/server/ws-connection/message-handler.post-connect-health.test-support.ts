@@ -1,7 +1,25 @@
 import { onTestFinished, vi, type Mock } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { HealthSummary } from "../../health/types.js";
+import { getGatewayLocalUserIngress } from "../../local-user-ingress.js";
 import { createOperatorWsClient } from "./authenticated-request-dispatch.test-support.js";
+
+export type CloseGatewayConnection = (code?: number, reason?: string) => void;
+export type SetCloseCause = (cause: string, meta?: Record<string, unknown>) => void;
+
+export function createCloseMock() {
+  return vi.fn<CloseGatewayConnection>();
+}
+
+export function createSetCloseCauseMock() {
+  return vi.fn<SetCloseCause>();
+}
+
+export function localUserIngressFor(client: unknown) {
+  return typeof client === "object" && client !== null
+    ? getGatewayLocalUserIngress(client)
+    : undefined;
+}
 
 export function useGatewayTestConfig<T>(mock: Mock<() => T>, implementation: () => T) {
   const previous = mock.getMockImplementation();

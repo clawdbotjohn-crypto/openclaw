@@ -252,8 +252,8 @@ it("finishes accepted MCP removal and OAuth cleanup after the original admin is 
       const committed = await readFile(state.configPath, "utf8");
       expect((JSON.parse(committed) as OpenClawConfig).mcp?.servers?.fixture).toBeUndefined();
       for (const identity of identities) {
-        expect(readMcpOAuthStore(identity.storeKey).tokens).toBeDefined();
-        expect(readMcpOAuthPendingAuthorization(`${identity.principal}-callback`)).toBe(
+        expect((await readMcpOAuthStore(identity.storeKey)).tokens).toBeDefined();
+        expect(await readMcpOAuthPendingAuthorization(`${identity.principal}-callback`)).toBe(
           identity.storeKey,
         );
       }
@@ -265,8 +265,10 @@ it("finishes accepted MCP removal and OAuth cleanup after the original admin is 
       expect(outcome.result?.reply?.text).toContain('MCP server "fixture" removed');
       expect(await readFile(state.configPath, "utf8")).toBe(committed);
       for (const identity of identities) {
-        expect(readMcpOAuthStore(identity.storeKey)).toEqual({ credentialState: "cleared" });
-        expect(readMcpOAuthPendingAuthorization(`${identity.principal}-callback`)).toBeUndefined();
+        expect(await readMcpOAuthStore(identity.storeKey)).toEqual({ credentialState: "cleared" });
+        expect(
+          await readMcpOAuthPendingAuthorization(`${identity.principal}-callback`),
+        ).toBeUndefined();
       }
     } finally {
       finishCleanup.resolve();

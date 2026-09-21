@@ -35,7 +35,6 @@ import type { ResolvedGatewayAuth } from "../../auth.js";
 import { gitHubPublicApi } from "../../github-public-api.js";
 import type { HealthSummary } from "../../health/types.js";
 import type { GatewayAttributedIngress } from "../../ingress-attribution.js";
-import { getGatewayLocalUserIngress } from "../../local-user-ingress.js";
 import { getOperatorApprovalRuntimeToken } from "../../operator-approval-runtime-token.js";
 import { GatewayConnectionWork } from "../../server-connection-work.js";
 import {
@@ -55,10 +54,15 @@ import { GatewayClientRegistry } from "../client-registry.js";
 import { createGatewayWsTestLogger as createLogger } from "../ws-connection.test-helpers.js";
 import { resolveSharedGatewaySessionGeneration } from "../ws-shared-generation.js";
 import {
+  createCloseMock,
   createConnectedTestClient,
   createGatewayAttachmentCompletion,
   createHealthSummary,
+  createSetCloseCauseMock,
+  localUserIngressFor,
   useGatewayTestConfig,
+  type CloseGatewayConnection,
+  type SetCloseCause,
 } from "./message-handler.post-connect-health.test-support.js";
 import { GatewayNodeLifecycleDispatchTracker } from "./node-lifecycle-dispatch.js";
 
@@ -152,12 +156,6 @@ vi.mock("../../../config/config.js", () => ({
   getRuntimeConfig: loadConfigMock,
   loadConfig: loadConfigMock,
 }));
-
-function localUserIngressFor(client: unknown) {
-  return typeof client === "object" && client !== null
-    ? getGatewayLocalUserIngress(client)
-    : undefined;
-}
 
 vi.mock("../../../config/io.js", () => ({
   getRuntimeConfig: loadConfigMock,
@@ -268,17 +266,6 @@ async function createTestAgentRuntimeIdentityLease() {
       operationalRunInstance: prepared.operationalRunInstance,
     }),
   };
-}
-
-type CloseGatewayConnection = (code?: number, reason?: string) => void;
-type SetCloseCause = (cause: string, meta?: Record<string, unknown>) => void;
-
-function createCloseMock() {
-  return vi.fn<CloseGatewayConnection>();
-}
-
-function createSetCloseCauseMock() {
-  return vi.fn<SetCloseCause>();
 }
 
 function captureSecurityEvents(): {
@@ -1535,6 +1522,7 @@ describe("attachGatewayWsMessageHandler post-connect health refresh", () => {
         caps: [],
       });
 
+      await harness.whenAttached;
       await waitForFast(() => {
         expect(harness.client).toMatchObject({
           authenticatedUserId: "ada@passkey",
@@ -2627,7 +2615,7 @@ describe("attachGatewayWsMessageHandler post-connect health refresh", () => {
     async (id, scope, allowed) => {
       await withOpenClawTestState({ label: "gateway-control-ui-admin" }, async () => {
         const harness = connectTrustedProxyUser("control-ui-authority", { id }, [scope]);
-        await waitForFast(() => expect(harness.client).not.toBeNull());
+        await harness.whenAttached;
         expect(harness.client).toMatchObject({ connect: { scopes: [scope] } });
         const admission = resolveGatewayCronCreatorAuthorityAdmission({
           runId: "control-ui-admin-run",
