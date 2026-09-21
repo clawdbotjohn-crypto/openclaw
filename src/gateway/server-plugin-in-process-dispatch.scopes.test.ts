@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   callAgentToolGatewayRequest,
   callInProcessGatewayTool,
+  runWithGatewayToolContinuationContext,
 } from "../agents/tools/in-process-gateway.js";
 import { dispatchGatewayMethod } from "../plugin-sdk/gateway-method-runtime.js";
 import {
@@ -263,6 +264,7 @@ describe("native tool scope provenance", () => {
     system?: boolean;
     unbound?: boolean;
     nested?: boolean;
+    continuation?: boolean;
     read?: boolean;
     broad?: boolean;
     admin?: boolean;
@@ -306,13 +308,27 @@ describe("native tool scope provenance", () => {
       system: true,
       nested: true,
     },
+    {
+      name: "nested System continuation ceiling",
+      source: ["operator.admin"],
+      explicit: ["operator.sessions.write"],
+      system: true,
+      nested: true,
+      continuation: true,
+    },
   ])("preserves $name through the registered native request", async (testCase) => {
     const requiredScope = testCase.read ? "operator.sessions.read" : "operator.sessions.write";
     const broadScope = testCase.read ? "operator.read" : "operator.write";
     const method = "scopeProof.native";
     const handler = vi.fn(async ({ client, params, respond }: GatewayRequestHandlerOptions) => {
       if (params.nested) {
-        respond(true, await callAgentToolGatewayRequest({ method, params: {} }));
+        const request = () => callAgentToolGatewayRequest({ method, params: {} });
+        respond(
+          true,
+          await (testCase.continuation
+            ? runWithGatewayToolContinuationContext(request)
+            : request()),
+        );
         return;
       }
       expect(client?.connect.scopes?.includes("operator.admin") ?? false).toBe(
@@ -395,5 +411,53 @@ describe("native tool scope provenance", () => {
     } finally {
       captured?.release();
     }
+  });
+
+  it.each<{ name: string; scopes: OperatorScope[]; read: boolean }>([
+    { name: "empty", scopes: [], read: false },
+    { name: "read-only", scopes: ["operator.read"], read: true },
+  ])("preserves an unidentified continuation's $name ceiling", async ({ scopes, read }) => {
+    const owner = createOperatorClient({ profileId: "unidentified-continuation", scopes });
+    const client = {
+      ...owner,
+      authenticatedUserId: undefined,
+      authenticatedUserProfile: undefined,
+    };
+    const handler = vi.fn(({ respond }: GatewayRequestHandlerOptions) =>
+      respond(true, { ok: true }),
+    );
+    const context = createContext();
+    context.getGatewayMethodRegistry = () =>
+      createGatewayMethodRegistry(
+        (["read", "write"] as const).map((access) => ({
+          name: `scopeProof.${access}`,
+          scope: `operator.${access}` as const,
+          owner: { kind: "core" as const, area: "scope-proof" },
+          profileAccess: "independent" as const,
+          handler,
+        })),
+      );
+    await withPluginRuntimeGatewayRequestScope(
+      { client, context, isWebchatConnect: () => false },
+      () =>
+        runWithGatewayToolContinuationContext(async () => {
+          for (const access of ["read", "write"] as const) {
+            const request = dispatchGatewayMethodInProcess(
+              `scopeProof.${access}`,
+              {},
+              {
+                disableSyntheticClient: true,
+                requireScopedClient: true,
+              },
+            );
+            if (access === "read" && read) {
+              await expect(request).resolves.toEqual({ ok: true });
+            } else {
+              await expect(request).rejects.toThrow(`missing scope: operator.${access}`);
+            }
+          }
+        }),
+    );
+    expect(handler).toHaveBeenCalledTimes(read ? 1 : 0);
   });
 });
