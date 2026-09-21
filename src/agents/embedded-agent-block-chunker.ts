@@ -41,6 +41,8 @@ type BlockChunkDrain = {
     chunk: string,
     options?: {
       sourceText: string;
+      sourceGeneration: number;
+      reconciledSourceBreak?: true;
       sourceStart: number;
       sourceEnd: number;
       startsAtLineStart: boolean;
@@ -154,6 +156,7 @@ export class EmbeddedBlockChunker {
   #consumedLength = 0;
   #preparedSourceBreaks: number[] = [];
   #sourceBreaks: readonly number[] = [];
+  #sourceGeneration = 0;
   #sourceOffset = 0;
   #nextSourceBreak = 0;
   #bufferStartsAtLineStart = true;
@@ -179,6 +182,7 @@ export class EmbeddedBlockChunker {
     this.#consumedLength = 0;
     this.#preparedSourceBreaks = [];
     this.#sourceBreaks = sourceBreaks;
+    this.#sourceGeneration += 1;
     this.#sourceOffset = sourceOffset;
     this.#nextSourceBreak = 0;
     this.#bufferStartsAtLineStart = true;
@@ -273,7 +277,7 @@ export class EmbeddedBlockChunker {
       const availableLength = this.bufferedText.length;
       const tail = this.#buffer.slice(length);
       this.#buffer = this.#buffer.slice(0, length);
-      this.#drainBuffer(params, availableLength);
+      this.#drainBuffer(params, availableLength, true);
       if (this.#sourceBreaks !== sourceBreaks) {
         return;
       }
@@ -287,7 +291,7 @@ export class EmbeddedBlockChunker {
     this.#drainBuffer(params);
   }
 
-  #drainBuffer(params: BlockChunkDrain, availableLength = 0) {
+  #drainBuffer(params: BlockChunkDrain, availableLength = 0, reconciledSourceBreak = false) {
     // KNOWN: We cannot split inside fenced code blocks (Markdown breaks + UI glitches).
     // When forced (maxChars), we close + reopen the fence to keep Markdown valid.
     const { emit } = params;
@@ -331,6 +335,8 @@ export class EmbeddedBlockChunker {
         preparedSourceBreaks.push(sourceStart + this.#buffer.length);
         emit(source, {
           sourceText: this.#buffer,
+          sourceGeneration: this.#sourceGeneration,
+          reconciledSourceBreak: reconciledSourceBreak || undefined,
           sourceStart: this.#sourceOffset + this.#consumedLength,
           sourceEnd: this.#sourceOffset + this.#consumedLength + this.#buffer.length,
           startsAtLineStart,
@@ -388,6 +394,8 @@ export class EmbeddedBlockChunker {
       preparedSourceBreaks.push(sourceStart + sourceOffset(to));
       emit(chunk, {
         sourceText: this.#buffer.slice(sourceOffset(from), sourceOffset(to)),
+        sourceGeneration: this.#sourceGeneration,
+        reconciledSourceBreak: reconciledSourceBreak || undefined,
         sourceStart: this.#sourceOffset + this.#consumedLength + sourceOffset(from),
         sourceEnd: this.#sourceOffset + this.#consumedLength + sourceOffset(to),
         startsAtLineStart:
