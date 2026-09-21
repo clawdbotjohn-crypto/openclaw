@@ -196,6 +196,32 @@ export type SessionBranchSummaryWorkerInput = {
   request: SessionBranchSummaryReadRequest;
 };
 
+export type SessionHistoryWorkerInput =
+  | SessionTranscriptHistoryWorkerInput
+  | SessionPreviewWorkerInput
+  | SessionTitleFieldsWorkerInput
+  | SessionRowPresenceWorkerInput
+  | SessionMembersWorkerInput
+  | SessionEntryListWorkerInput
+  | SessionExactEntriesWorkerInput
+  | SessionStoreTargetWorkerInput
+  | SessionTargetInventoryWorkerInput
+  | SessionIdentityEvidenceWorkerInput
+  | SessionUsageCacheWorkerInput
+  | SessionTranscriptSearchWorkerInput;
+
+export type SessionTranscriptWorkerInput =
+  | SessionHistoryWorkerInput
+  | SessionModelContextWorkerInput
+  | SessionEntryWorkerInput
+  | SessionBranchSummaryWorkerInput;
+
+type SessionHistoryDatabaseWorkerInput = Extract<SessionHistoryWorkerInput, { database: unknown }>;
+
+export type SessionHistoryWorkerPreparedInput = {
+  [Input in SessionHistoryDatabaseWorkerInput as Input["kind"]]: Omit<Input, "database">;
+}[SessionHistoryDatabaseWorkerInput["kind"]];
+
 export type SessionTranscriptWorkerValues = {
   "transcript-search": SessionTranscriptSearchWorkerResult;
   "branch-summaries": SessionBranchSummaryReadResult;
