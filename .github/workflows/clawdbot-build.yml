@@ -1,0 +1,94 @@
+name: Clawdbot fork package build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [clawdbot-stable]
+    paths:
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "src/**"
+      - "extensions/**"
+      - "packages/**"
+      - "scripts/**"
+      - "ui/**"
+      - ".github/workflows/clawdbot-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clawdbot-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build and smoke-test package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.23.0 --activate
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build npm package
+        run: |
+          mkdir -p artifacts
+          pnpm pack --pack-destination artifacts
+
+      - name: Record checksums and build metadata
+        id: artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tarball="$(find artifacts -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          tarball="$(realpath "$tarball")"
+          sha256sum "$tarball" > "${tarball}.sha256"
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "node=$(node --version)"
+            echo "pnpm=$(pnpm --version)"
+            echo "tarball=$(basename "$tarball")"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > artifacts/build-metadata.txt
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Install and smoke-test in isolated prefix
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          prefix="$RUNNER_TEMP/openclaw-prefix"
+          state="$RUNNER_TEMP/openclaw-state"
+          config="$RUNNER_TEMP/openclaw.json"
+          mkdir -p "$prefix" "$state"
+          printf '{}\n' > "$config"
+          npm install --global --prefix "$prefix" "${{ steps.artifact.outputs.tarball }}"
+          OPENCLAW_STATE_DIR="$state" OPENCLAW_CONFIG_PATH="$config" \
+            "$prefix/bin/openclaw" --version
+          OPENCLAW_STATE_DIR="$state" OPENCLAW_CONFIG_PATH="$config" \
+            "$prefix/bin/openclaw" --help >/dev/null
+
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: openclaw-clawdbot-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
