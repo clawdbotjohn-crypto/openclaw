@@ -19,9 +19,10 @@ export type UserProfileAccessFacts = Readonly<{
 
 export type PreparedUserProfileIdentity = {
   readonly emailBindingIds: readonly string[];
-  assertCurrent(this: void, requiredEmailBindingIds?: readonly string[]): void;
-  readCurrentProfile(this: void): UserProfileAccessFacts;
-  readCurrentAliases(this: void): ReadonlySet<string>;
+  readCurrentFacts(
+    this: void,
+    requiredEmailBindingIds?: readonly string[],
+  ): { profile: UserProfileAccessFacts; aliases: ReadonlySet<string> };
   release(this: void): void;
 };
 

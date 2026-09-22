@@ -49,26 +49,16 @@ type Coordinator = ReturnType<typeof createTestGitHubPublicationCoordinator>;
 type Requester = NonNullable<Parameters<Coordinator["requestForSession"]>[0]["requester"]>;
 export const guestScopes = [SESSION_READ_SCOPE, SESSION_WRITE_SCOPE];
 
-export async function createRequesterPublicationFixture(
-  checkpoint: Mock,
-  backend: Backend,
-  session: { sessionId: string; sessionKey: string } = REQUEST,
+async function createRequesterPolicySources(
+  session: { sessionId: string; sessionKey: string },
+  workspace: string,
 ) {
-  const repository =
-    backend === "repository"
-      ? await createRepositoryPublicationFixture(checkpoint, undefined, session)
-      : undefined;
-  await persistPublicationTestSession(session.sessionKey);
   const guestProfile = ensureProfileForEmail("publication-guest@example.test").id;
   const maintainerProfile = ensureProfileForEmail("publication-maintainer@example.test").id;
   setUserProfileRole(maintainerProfile, "maintainer");
   invalidateOperatorRolePolicy(maintainerProfile);
-  const local =
-    backend === "local"
-      ? await createRealPublicationWorkspace(undefined, session.sessionKey)
-      : undefined;
   const config: OpenClawConfig = {
-    agents: { list: [{ id: "main", default: true, workspace: local?.cwd ?? "/repo/worktree" }] },
+    agents: { list: [{ id: "main", default: true, workspace }] },
     session: { maintenance: { mode: "warn" } },
     gateway: {
       roles: {
@@ -103,8 +93,6 @@ export async function createRequesterPublicationFixture(
   const guest = guestSource.requester;
   const maintainer = maintainerSource.requester;
   const database = openOpenClawStateDatabase();
-  const placements = repository?.placements ?? createWorkerSessionPlacementStore({ database });
-  const coordinator = createTestGitHubPublicationCoordinator({ placements });
   const publishedTitles: string[] = [];
   const externalWrites: string[] = [];
   const transport = mocks.runCommand.getMockImplementation()!;
@@ -117,6 +105,50 @@ export async function createRequesterPublicationFixture(
     }
     return await transport(argv, options);
   });
+  return {
+    config,
+    session,
+    database,
+    guest,
+    guestSource,
+    guestProfile,
+    maintainer,
+    maintainerSource,
+    maintainerProfile,
+    publishedTitles,
+    externalWrites,
+    revoke() {
+      setUserProfileRole(guestProfile, "revoked");
+      invalidateOperatorRolePolicy(guestProfile);
+    },
+  };
+}
+
+export async function createRequesterPolicyFixture(
+  session: { sessionId: string; sessionKey: string } = REQUEST,
+) {
+  await persistPublicationTestSession(session.sessionKey);
+  return await createRequesterPolicySources(session, "/repo/worktree");
+}
+
+export async function createRequesterPublicationFixture(
+  checkpoint: Mock,
+  backend: Backend,
+  session: { sessionId: string; sessionKey: string } = REQUEST,
+) {
+  const repository =
+    backend === "repository"
+      ? await createRepositoryPublicationFixture(checkpoint, undefined, session)
+      : undefined;
+  await persistPublicationTestSession(session.sessionKey);
+  const local =
+    backend === "local"
+      ? await createRealPublicationWorkspace(undefined, session.sessionKey)
+      : undefined;
+  const policy = await createRequesterPolicySources(session, local?.cwd ?? "/repo/worktree");
+  const placements =
+    repository?.placements ?? createWorkerSessionPlacementStore({ database: policy.database });
+  const coordinator = createTestGitHubPublicationCoordinator({ placements });
   const request = (idempotencyKey: string, requester: Requester, title = idempotencyKey) => ({
     sessionKey: session.sessionKey,
     agentId: "main",
@@ -125,27 +157,13 @@ export async function createRequesterPublicationFixture(
     requester,
   });
   return {
+    ...policy,
     backend,
     local,
     repository,
-    config,
-    session,
-    database,
     placements,
     coordinator,
-    guest,
-    guestSource,
-    guestProfile,
-    maintainer,
-    maintainerSource,
-    maintainerProfile,
     request,
-    publishedTitles,
-    externalWrites,
-    revoke() {
-      setUserProfileRole(guestProfile, "revoked");
-      invalidateOperatorRolePolicy(guestProfile);
-    },
     restart() {
       return createTestGitHubPublicationCoordinator({
         placements: createWorkerSessionPlacementStore({ database: openOpenClawStateDatabase() }),
@@ -205,9 +223,7 @@ type StoredVisitorGrant = {
   expiresAt: number | null;
 };
 
-export function requireVisitorPublicationPolicy(
-  f: Awaited<ReturnType<typeof createRequesterPublicationFixture>>,
-): OpenClawConfig {
+export function requireVisitorPublicationPolicy(f: { config: OpenClawConfig }): OpenClawConfig {
   const roles = f.config.gateway!.roles!;
   const config: OpenClawConfig = {
     ...f.config,
@@ -230,9 +246,12 @@ export function requireVisitorPublicationPolicy(
   return config;
 }
 
-export async function prepareVisitorPublicationFixture(
-  f: Awaited<ReturnType<typeof createRequesterPublicationFixture>>,
-) {
+export async function prepareVisitorPublicationFixture(f: {
+  config: OpenClawConfig;
+  session: { sessionKey: string };
+  maintainer: Requester;
+  local?: { cwd: string };
+}) {
   const [
     { loadAndActivateRootPluginRegistry },
     { startPluginServices },

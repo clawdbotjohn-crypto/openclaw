@@ -67,7 +67,7 @@ it("publishes a created email profile after lost result delivery while its datab
       const created = await prepareUserProfileIdentity(profile.id);
       try {
         expect(created.emailBindingIds).toEqual([expect.any(String)]);
-        expect(() => created.assertCurrent(created.emailBindingIds)).not.toThrow();
+        expect(() => created.readCurrentFacts(created.emailBindingIds)).not.toThrow();
       } finally {
         created.release();
       }
@@ -101,8 +101,10 @@ it("does not restore an old binding from a creation reply delivered after alias 
       try {
         expect(current.emailBindingIds).toHaveLength(2);
         expect(current.emailBindingIds).not.toContain(originalBinding);
-        expect(() => current.assertCurrent([originalBinding!])).toThrow("user profile not found");
-        expect(() => current.assertCurrent(current.emailBindingIds)).not.toThrow();
+        expect(() => current.readCurrentFacts([originalBinding!])).toThrow(
+          "user profile not found",
+        );
+        expect(() => current.readCurrentFacts(current.emailBindingIds)).not.toThrow();
       } finally {
         current.release();
       }

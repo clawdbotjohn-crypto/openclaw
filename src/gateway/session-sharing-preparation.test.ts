@@ -78,7 +78,7 @@ it.each(["durable", "incognito"] as const)(
           try {
             const current = prepared.readCurrent(cfg);
             observed.push({
-              visibility: current.target?.entry.visibility,
+              visibility: current.target.entry.visibility,
               member: current.membership.has("requester"),
             });
           } catch (error) {
@@ -116,7 +116,7 @@ it.each(["durable", "incognito"] as const)(
         assertWithoutSql(kind === "incognito");
         expect(observed.at(-1)).toEqual({ visibility: "read-only", member: false });
         observed.length = 0;
-        const target = read.readCurrent(cfg).target!;
+        const target = read.readCurrent(cfg).target;
         runOpenClawAgentWriteTransaction(
           (database) => {
             writeSessionEntry(database, sessionKey, {
@@ -166,9 +166,7 @@ it.each(["durable", "incognito"] as const)(
         expect(observationErrors[0]).toHaveProperty("message", unavailableMessage);
         expect(() => read.readCurrent(cfg)).toThrow(unavailableMessage);
         replacementRead = await prepareSessionMutationFacts({ cfg, sessionKey, agentId: "main" });
-        expect(replacementRead.readCurrent(cfg).target?.entry.sessionId).toBe(
-          "replacement-session",
-        );
+        expect(replacementRead.readCurrent(cfg).target.entry.sessionId).toBe("replacement-session");
         await closeOpenClawAgentDatabaseByPathAsync(databasePath, target.agentId);
         expect(() => replacementRead!.readCurrent(cfg)).toThrow(unavailableMessage);
         read.release();
@@ -182,7 +180,7 @@ it.each(["durable", "incognito"] as const)(
   },
 );
 
-it("keeps unavailable durable metadata distinct from an absent session", async () => {
+it("rejects unavailable durable metadata", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const storePath = state.statePath("unavailable.sqlite");
     fs.writeFileSync(storePath, "");
@@ -195,7 +193,7 @@ it("keeps unavailable durable metadata distinct from an absent session", async (
   });
 });
 
-it("invalidates a prepared absence when a restricted session is created at that key", async () => {
+it("requires an existing session before preparing sharing facts", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const storePath = state.statePath("negative-sharing.sqlite");
     const cfg = {
@@ -213,46 +211,34 @@ it("invalidates a prepared absence when a restricted session is created at that 
       { agentId: "main", sessionKey: "agent:main:existing", storePath },
       { sessionId: "existing", updatedAt: 1 },
     );
-    let prepared: Awaited<ReturnType<typeof prepareSessionMutationFacts>> | undefined;
-    const observed: unknown[] = [];
-    const stop = sessionChanges.subscribe((change) => {
-      if (prepared && "sessionKey" in change && change.sessionKey === sessionKey) {
-        try {
-          observed.push(prepared.readCurrent(cfg));
-        } catch (error) {
-          observed.push(error);
-        }
-      }
-    });
+    await expect(prepareSessionMutationFacts({ cfg, sessionKey, agentId: "main" })).rejects.toThrow(
+      unavailableMessage,
+    );
+    replaceSessionEntrySync(
+      { agentId: "main", sessionKey, storePath },
+      {
+        sessionId: "new-restricted-session",
+        lifecycleRevision: "new-restricted-generation",
+        updatedAt: 1,
+        visibility: "draft",
+        sandbox: "required",
+        createdActor: { type: "human", source: "profile", id: "other" },
+      },
+    );
+    const prepared = await prepareSessionMutationFacts({ cfg, sessionKey, agentId: "main" });
     try {
-      prepared = await prepareSessionMutationFacts({ cfg, sessionKey, agentId: "main" });
-      const read = prepared;
       const client = sharingPolicyClient({ user: "requester" });
       const policy = { ...cfg.gateway!.roles!.definitions.view!, sandbox: "required" as const };
-      const authorize = () =>
-        authorizePreparedSessionMutation(
-          { cfg, client, sessionKey, agentId: "main" },
-          read.readCurrent(cfg),
-          { policy, aliases: new Set(["requester"]) },
-        );
-      expect(read.readCurrent(cfg).target).toBeNull();
-      expect(authorize()).toBeNull();
-      replaceSessionEntrySync(
-        { agentId: "main", sessionKey, storePath },
-        {
-          sessionId: "new-restricted-session",
-          updatedAt: 1,
-          visibility: "draft",
-          createdActor: { type: "human", source: "profile", id: "other" },
-        },
-      );
-      expect(observed).toHaveLength(1);
-      expect(observed[0]).toBeInstanceOf(Error);
-      expect(observed[0]).toHaveProperty("message", unavailableMessage);
-      expect(authorize).toThrow(unavailableMessage);
+      const facts = prepared.readCurrent(cfg);
+      expect(facts.target.entry.sessionId).toBe("new-restricted-session");
+      expect(
+        authorizePreparedSessionMutation({ cfg, client, sessionKey, agentId: "main" }, facts, {
+          policy,
+          aliases: new Set(["requester"]),
+        })?.message,
+      ).toContain("session is draft");
     } finally {
-      stop();
-      prepared?.release();
+      prepared.release();
     }
   });
 });
@@ -279,7 +265,7 @@ it("does not transfer prepared sharing facts to a replacement store behind the s
     setRuntimeConfigSnapshot(cfg);
     const prepared = await prepareSessionMutationFacts({ cfg, sessionKey, agentId: "main" });
     try {
-      expect(prepared.readCurrent(cfg).target?.entry.sessionId).toBe("identical");
+      expect(prepared.readCurrent(cfg).target.entry.sessionId).toBe("identical");
       fs.rmSync(alias, { recursive: true });
       fs.symlinkSync(state.statePath("replacement"), alias, "junction");
       expect(() => prepared.readCurrent(cfg)).toThrow(unavailableMessage);
@@ -336,7 +322,7 @@ it("invalidates selected facts before observers when another searched store gain
     });
     try {
       prepared = await prepareSessionMutationFacts(scope);
-      expect(prepared.readCurrent(cfg).target?.entry.sessionId).toBe("selected");
+      expect(prepared.readCurrent(cfg).target.entry.sessionId).toBe("selected");
       replaceSessionEntrySync(
         { agentId: "main", sessionKey, storePath: secondaryStore },
         {

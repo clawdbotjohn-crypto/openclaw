@@ -25,6 +25,7 @@ import { GitHubPublicationRequesterUnavailableError } from "./github-publication
 import { GitHubPublicationRecoveryPendingError } from "./github-publication-git-index.js";
 import { captureGitHubPublicationRequester } from "./github-publication-requester.js";
 import {
+  createRequesterPolicyFixture,
   createRequesterPublicationFixture,
   guestScopes,
   holdWorkerTurn,
@@ -58,7 +59,7 @@ describe("shared GitHub publication requester authority", () => {
   });
 
   it("distinguishes explicit System authority from missing, unclassified, and closed sources", async () => {
-    const f = await fixture("local");
+    const f = await createRequesterPolicyFixture();
     const { context, session } = f.guestSource;
     const system = await captureGitHubPublicationRequester(
       {

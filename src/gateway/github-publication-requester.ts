@@ -88,8 +88,7 @@ function prepareRequesterPolicy(
       if (!identity) {
         throw new GitHubPublicationRequesterUnavailableError();
       }
-      identity.assertCurrent(snapshot.grant?.aliasBindingIds);
-      return { profile: identity.readCurrentProfile(), aliases: identity.readCurrentAliases() };
+      return identity.readCurrentFacts(snapshot.grant?.aliasBindingIds);
     } catch {
       throw new GitHubPublicationRequesterUnavailableError();
     }

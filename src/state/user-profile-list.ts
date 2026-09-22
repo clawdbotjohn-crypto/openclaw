@@ -541,18 +541,22 @@ export async function prepareUserProfileIdentity(
       }
       return ids;
     },
-    assertCurrent,
-    readCurrentProfile(this: void) {
-      assertCurrent();
+    readCurrentFacts(this: void, requiredEmailBindingIds) {
+      assertCurrent(requiredEmailBindingIds);
+      const aliases = new Set([profileId]);
+      for (const row of rows.values()) {
+        if (row.merged_into === profileId) {
+          aliases.add(row.id);
+        }
+      }
       return {
-        profileId,
-        emails: [...(bindings.emailsByProfile.get(profileId) ?? [])].toSorted(),
-        assignedRole: rows.get(profileId)?.role || null,
+        profile: {
+          profileId,
+          emails: [...(bindings.emailsByProfile.get(profileId) ?? [])].toSorted(),
+          assignedRole: rows.get(profileId)?.role || null,
+        },
+        aliases,
       };
-    },
-    readCurrentAliases(this: void) {
-      assertCurrent();
-      return readUserProfileAliases(profileId, { ...options, path: pathname });
     },
     release(this: void) {
       if (active) {

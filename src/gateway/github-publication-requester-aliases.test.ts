@@ -22,6 +22,7 @@ import {
   restoreGitHubPublicationRequester,
 } from "./github-publication-requester.js";
 import {
+  createRequesterPolicyFixture,
   createRequesterPublicationFixture,
   guestScopes,
   holdWorkerTurn,
@@ -46,7 +47,7 @@ describe("shared GitHub publication requester alias bindings", () => {
   it.each(["alias interruption", "role revocation"] as const)(
     "uses current resumed-grant profile facts without profile SQL and checks callback %s",
     async (callbackChange) => {
-      const f = await fixture("local");
+      const f = await createRequesterPolicyFixture();
       const email = "publication-guest@example.test";
       const later = "publication-later-alias@example.test";
       const other = ensureProfileForEmail("publication-alias-recipient@example.test");

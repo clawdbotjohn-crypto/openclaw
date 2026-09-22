@@ -33,6 +33,10 @@ import {
 } from "./session-utils-store-lookup.js";
 import { resolveCanonicalSessionStoreMatchFromStoreKeys } from "./session-utils-store.js";
 
+type ExistingSessionMutationFacts = PreparedSessionMutationFacts & {
+  target: NonNullable<PreparedSessionMutationFacts["target"]>;
+};
+
 class SessionMutationFactsUnavailableError extends Error {
   constructor(options?: ErrorOptions) {
     super("Session access facts are unavailable; retry after session storage is ready.", options);
@@ -49,13 +53,13 @@ function routeFacts(cfg: OpenClawConfig) {
   };
 }
 
-/** Retain selected facts, not an access decision; committed writers keep this read current. */
+/** Retain an existing session generation; committed writers keep its access facts current. */
 export async function prepareSessionMutationFacts(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   agentId: string;
 }): Promise<{
-  readCurrent(this: void, cfg: OpenClawConfig): PreparedSessionMutationFacts;
+  readCurrent(this: void, cfg: OpenClawConfig): ExistingSessionMutationFacts;
   release(this: void): void;
 }> {
   const route = routeFacts(params.cfg);
@@ -63,7 +67,7 @@ export async function prepareSessionMutationFacts(params: {
   const releases: Array<() => void> = [];
   let active = true;
   let invalidated = false;
-  let facts: PreparedSessionMutationFacts | undefined;
+  let facts: ExistingSessionMutationFacts | undefined;
   const selectedPaths = new Set<string>();
   const release = () => {
     if (active) {
@@ -109,7 +113,7 @@ export async function prepareSessionMutationFacts(params: {
     if (
       change.scope === "automation" ||
       (change.agentId && change.agentId !== agentId && !change.storePath) ||
-      ![params.sessionKey, canonicalKey, ...(facts?.target?.storeKeys ?? [])].includes(
+      ![params.sessionKey, canonicalKey, ...(facts?.target.storeKeys ?? [])].includes(
         change.sessionKey,
       )
     ) {
@@ -121,7 +125,7 @@ export async function prepareSessionMutationFacts(params: {
       return;
     }
     if (
-      !facts?.target ||
+      !facts ||
       !selectedPaths.has(path.resolve(change.storePath)) ||
       !isPreparedSessionSharingChange(change)
     ) {
@@ -310,22 +314,20 @@ export async function prepareSessionMutationFacts(params: {
         selected.storeKeys,
       );
       const sharing = members.get(selected.storePath);
-      if (!sharing) {
+      if (!match || !sharing) {
         throw new SessionMutationFactsUnavailableError();
       }
       facts = {
-        target: match
-          ? {
-              agentId: selected.agentId,
-              canonicalKey: selected.canonicalKey,
-              storePath: selected.storePath,
-              storeKeys: selected.storeKeys,
-              entry: projectSessionSharingEntry(match.entry),
-              storeKey: match.key,
-            }
-          : null,
+        target: {
+          agentId: selected.agentId,
+          canonicalKey: selected.canonicalKey,
+          storePath: selected.storePath,
+          storeKeys: selected.storeKeys,
+          entry: projectSessionSharingEntry(match.entry),
+          storeKey: match.key,
+        },
         membership: new Set(
-          sharing.members.find((member) => member.sessionKey === match?.key)?.identityIds,
+          sharing.members.find((member) => member.sessionKey === match.key)?.identityIds,
         ),
       };
       selectedPaths.add(path.resolve(selected.storePath));
@@ -343,9 +345,7 @@ export async function prepareSessionMutationFacts(params: {
         selectedPaths.add(path.resolve(candidate.path));
       }
       const target = facts.target;
-      const retained = retainedReads.get(
-        `${sharing.databaseIdentity}\0${target?.storeKey ?? selected.canonicalKey}`,
-      );
+      const retained = retainedReads.get(`${sharing.databaseIdentity}\0${target.storeKey}`);
       if (!retained) {
         throw new SessionMutationFactsUnavailableError();
       }
@@ -356,11 +356,11 @@ export async function prepareSessionMutationFacts(params: {
           }
         }
         const current = retained.readCurrent();
-        if (!current) {
+        if (!current?.entry) {
           throw new SessionMutationFactsUnavailableError();
         }
         return {
-          target: target && current.entry ? { ...target, entry: current.entry } : null,
+          target: { ...target, entry: current.entry },
           membership: current.membership,
         };
       };
