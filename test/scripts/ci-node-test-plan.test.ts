@@ -81,7 +81,11 @@ import { createUiIsolatedVitestConfig } from "../vitest/vitest.ui-isolated.confi
 import { uiTimingTestFiles } from "../vitest/vitest.ui-paths.mjs";
 import { createUiTimingVitestConfig } from "../vitest/vitest.ui-timing.config.ts";
 import { createUiVitestConfig } from "../vitest/vitest.ui.config.ts";
-import { getUnitFastTestFilesForIncludePatterns } from "../vitest/vitest.unit-fast-paths.mjs";
+import {
+  getUnitFastTestFilesForIncludePatterns,
+  getUnitFastIsolatedTestFiles,
+  getUnitFastTimerTestFiles,
+} from "../vitest/vitest.unit-fast-paths.mjs";
 import { createUnitFastVitestConfig } from "../vitest/vitest.unit-fast.config.ts";
 import { createUnitVitestConfigWithOptions } from "../vitest/vitest.unit.config.ts";
 import { createWizardVitestConfig } from "../vitest/vitest.wizard.config.ts";
@@ -136,6 +140,7 @@ describe("startup corpus coverage", () => {
 });
 
 const PLUGIN_PRERELEASE_NPM_SPEC_TEST = "src/plugins/install.npm-spec.test.ts";
+const RELEASE_REPORT_OWNER_TEST = "test/scripts/vitest-report-owner.test.ts";
 const PRIVATE_QA_TOOLING_TEST = "test/e2e/qa-lab/runtime/gateway-codex-delivery-cache.test.ts";
 const DEFAULT_NODE_TEST_RUNNER = "blacksmith-8vcpu-ubuntu-2404";
 const BUNDLED_NODE_TEST_RUNNER = "blacksmith-4vcpu-ubuntu-2404";
@@ -2862,8 +2867,13 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
         const actual = groups.flatMap((group) => group.includePatterns ?? []);
         expect(new Set(actual).size, owner.shardName).toBe(actual.length);
         if (owner.includePatterns) {
+          const expectedFiles = [compact, githubCompact, hybridCompact].includes(plan)
+            ? owner.includePatterns.filter(
+                (file) => !file.startsWith("test/scripts/") && !file.startsWith("src/scripts/"),
+              )
+            : owner.includePatterns;
           expect(actual.toSorted(), owner.shardName).toEqual(
-            retainedFiles(owner.includePatterns).toSorted(),
+            retainedFiles(expectedFiles).toSorted(),
           );
         } else if (owner.shardName === "agentic-agents-support") {
           expect(actual.toSorted()).toEqual(supportOwnerFiles.toSorted());
@@ -2896,7 +2906,10 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
           pluginSdkOwnerFiles,
           pluginSdkLightOwnerFiles,
           runtimeConfigOwnerFiles,
+          getUnitFastIsolatedTestFiles(),
+          getUnitFastTimerTestFiles(),
         )
+        .filter((file) => !file.startsWith("test/scripts/") && !file.startsWith("src/scripts/"))
         .toSorted((a, b) => a.localeCompare(b)),
     );
     expect(
@@ -5276,6 +5289,129 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
       if (buildMode) {
         expect(owner.shard.pretestBuildMode).toBe(buildMode);
       }
+    },
+  );
+
+  it("keeps the complete tooling family in manual plans and omits it from product plans", () => {
+    const automatic = createNodeTestShards({
+      includeReleaseOnlyToolingShards: false,
+      changedPaths: ["src/plugin-sdk/core.ts", "src/infra/home-dir.test.ts"],
+    });
+    expect(defaultShards.some((shard) => shard.shardName.startsWith("core-tooling-"))).toBe(true);
+    expect(automatic.some((shard) => shard.shardName.startsWith("core-tooling-"))).toBe(false);
+    expect(automatic.flatMap((shard) => shard.includePatterns ?? [])).not.toEqual(
+      expect.arrayContaining([RELEASE_REPORT_OWNER_TEST, "test/scripts/arg-utils.test.ts"]),
+    );
+    for (const shard of automatic) {
+      expect(shard.includePatterns?.some((file) => file.startsWith("test/scripts/"))).not.toBe(
+        true,
+      );
+    }
+    expect(automatic.flatMap((shard) => shard.includePatterns ?? [])).toContain(
+      "src/infra/home-dir.test.ts",
+    );
+  });
+
+  it.each([
+    RELEASE_REPORT_OWNER_TEST,
+    "test/scripts/arg-utils.test.ts",
+    "scripts/lib/vitest-report-owner.mts",
+    "scripts/test-extension-batch.mts",
+    "src/scripts/example.ts",
+    "scripts/README.md",
+    "config/ci-budget.md",
+    "test/vitest/vitest.tooling.config.ts",
+    "test/helpers/temp-dir.ts",
+    "config/ci-test-timings.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "patches/vitest@5.0.0.patch",
+    ".github/workflows/ci.yml",
+    ".github/ISSUE_TEMPLATE/bug_report.md",
+    ".crabbox.yaml",
+    "Dockerfile",
+    "apps/ios/fastlane/Fastfile",
+    "extensions/matrix/package.json",
+    "extensions/matrix/scripts/build.mjs",
+  ])("retains the complete tooling family when owner %s changes", (changedPath) => {
+    expect(
+      createNodeTestShards({
+        includeReleaseOnlyToolingShards: false,
+        changedPaths: ["src/plugin-sdk/core.ts", changedPath],
+      }),
+    ).toEqual(defaultShards);
+  });
+
+  it.each(["blacksmith", "github", "hybrid"])(
+    "preserves product coverage and canonical tooling owners across the %s release tier",
+    (runnerBackend) => {
+      const options = {
+        compactMode: "pull-request" as const,
+        includeReleaseOnlyPluginShards: false,
+        runnerBackend,
+      };
+      const full = getCommittedCompactPlan("pull-request", runnerBackend);
+      const automatic = createNodeTestShardBundles({
+        ...options,
+        includeReleaseOnlyToolingShards: false,
+        changedPaths: ["src/gateway/server.ts"],
+      });
+      const fullGroups = full.flatMap((job) => job.groups);
+      const automaticGroups = automatic.flatMap((job) => job.groups);
+      const productFiles = (groups: typeof fullGroups) =>
+        groups
+          .filter((group) => !group.configs.some((config) => config.includes("vitest.tooling")))
+          .flatMap(
+            (group) =>
+              group.includePatterns ??
+              group.configs.flatMap((config) => {
+                if (config === "test/vitest/vitest.unit-fast-isolated.config.ts") {
+                  return getUnitFastIsolatedTestFiles();
+                }
+                if (config === "test/vitest/vitest.unit-fast-fake-timers.config.ts") {
+                  return getUnitFastTimerTestFiles();
+                }
+                return [];
+              }),
+          )
+          .filter((file) => !file.startsWith("test/scripts/") && !file.startsWith("src/scripts/"))
+          .toSorted();
+      expect(
+        automaticGroups.some((group) =>
+          group.configs.some((config) => config.includes("vitest.tooling")),
+        ),
+      ).toBe(false);
+      expect(
+        automaticGroups
+          .flatMap((group) => group.includePatterns ?? [])
+          .some((file) => file.startsWith("test/scripts/")),
+      ).toBe(false);
+      expect(productFiles(automaticGroups)).toEqual(productFiles(fullGroups));
+      expect(
+        createNodeTestShardBundles({
+          ...options,
+          includeReleaseOnlyToolingShards: false,
+          changedPaths: ["package.json"],
+        }),
+      ).toEqual(full);
+      const push = createNodeTestShardBundles({
+        ...options,
+        compactMode: "push",
+        includeReleaseOnlyToolingShards: false,
+        changedPaths: ["package.json"],
+      });
+      expect(
+        push
+          .flatMap((job) => job.groups)
+          .some((group) => group.configs.some((config) => config.includes("vitest.tooling"))),
+      ).toBe(false);
+      expect(
+        push
+          .flatMap((job) => job.groups)
+          .flatMap((group) => group.includePatterns ?? [])
+          .some((file) => file.startsWith("test/scripts/")),
+      ).toBe(false);
     },
   );
 

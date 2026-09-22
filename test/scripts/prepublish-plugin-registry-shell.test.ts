@@ -362,12 +362,12 @@ if [ "$1" = --version ]; then
 elif [ "$1" = plugins ]; then
   test "$2" = install
   if [ "$3" = --help ]; then
-    printf '%s\\n' 'Usage: openclaw plugins install [options] <spec>' '  --force  Overwrite the installed plugin'
+    printf 'Usage: plugins install <spec>\\n'
   else
-    test "$#" = 4
     test "$4" = --force
     npm install --prefix "$PLUGIN_INSTALL" "$3" --ignore-scripts --no-fund --no-audit --package-lock=false
-    node -e 'const assert=require("node:assert/strict"); const spec=process.argv[1]; const name=spec.slice(0,spec.lastIndexOf("@")); const pkg=require(process.env.PLUGIN_INSTALL+"/node_modules/"+name+"/package.json"); assert.equal(pkg.provenance,"published"); assert.equal(pkg.version,process.env.BASELINE_VERSION);' "$3"
+    node -e 'const assert=require("node:assert/strict"); const spec=process.argv[1]; const name=spec.slice(0,spec.lastIndexOf("@")); const plugin=require(process.env.PLUGIN_INSTALL+"/node_modules/"+name+"/package.json"); assert.equal(plugin.provenance,"published"); assert.equal(plugin.version,process.env.BASELINE_VERSION);' "$3"
+    printf '%s\\n' "$3" >>"$COMPANION_INSTALLS"
   fi
 else
   test "$1" = gateway
@@ -452,6 +452,7 @@ node -e 'const assert=require("node:assert/strict"); for(const name of ["opencla
               NPM_CONFIG_USERCONFIG: "/dev/null",
               npm_config_userconfig: "/dev/null",
               PLUGIN_INSTALL: join(root, "plugin"),
+              COMPANION_INSTALLS: join(root, "companion-installs"),
               READY: join(root, "ready"),
               CANDIDATE_INSTALL: join(root, "candidate"),
               ROOT_TARBALL: join(fixture.artifactDir, "openclaw.tgz"),
@@ -464,6 +465,11 @@ node -e 'const assert=require("node:assert/strict"); for(const name of ["opencla
           result.stderr +
           (existsSync(gatewayLog) ? readFileSync(gatewayLog, "utf8") : "");
         expect(result.status, diagnostics).toBe(0);
+        if (stage === "startup") {
+          expect(readFileSync(join(root, "companion-installs"), "utf8").trim().split("\n")).toEqual(
+            ["codex", "discord", "whatsapp"].map((name) => `@openclaw/${name}@${BASELINE_VERSION}`),
+          );
+        }
       });
     },
   );
