@@ -45,6 +45,7 @@ import { cleanupSessionStateForTest } from "../test-utils/session-state-cleanup.
 import { buildWorkerConnectParams, type WorkerLaunchDescriptor } from "./launch-descriptor.js";
 import { createWorkerConnection, type WorkerConnection } from "./worker-connection.js";
 import { WorkerFaultPlacementLifecycle } from "./worker-fault-placement-lifecycle.test-support.js";
+import { bindWorkerFixtureSessionTarget } from "./worker-fault-session-target.test-support.js";
 import * as workerRpc from "./worker-rpc-clients.js";
 
 export const SESSION_ID = "fault-session";
@@ -158,7 +159,6 @@ type WorkerClientOptions = {
 
 export class ComposedGatewayHarness {
   readonly socketPath: string;
-  readonly stateDir: string;
   readonly cfg: OpenClawConfig;
   readonly database: stateDb.OpenClawStateDatabase;
   readonly store: envStore.WorkerEnvironmentStore;
@@ -188,6 +188,7 @@ export class ComposedGatewayHarness {
   private placementGateValue: WorkerSessionPlacementGate | undefined;
   private useReplacementExecutor = false;
   private unsubscribeLive: (() => void) | undefined;
+  private readonly restoreSessionTarget: () => void;
 
   static async create(root: string): Promise<ComposedGatewayHarness> {
     const sessionsDir = path.join(root, "agents", "main", "sessions");
@@ -209,7 +210,7 @@ export class ComposedGatewayHarness {
     readonly root: string,
     readonly sessionTarget: Awaited<ReturnType<typeof resolveSessionTranscriptRuntimeTarget>>,
   ) {
-    this.stateDir = path.join(root, "state");
+    const env = { OPENCLAW_STATE_DIR: path.join(root, "state") };
     this.socketPath = path.join(root, "gateway.sock");
     this.cfg = {
       agents: { list: [{ id: "main", default: true }] },
@@ -221,9 +222,7 @@ export class ComposedGatewayHarness {
         profiles: { development: { provider: "fake", settings: { region: "test" } } },
       },
     };
-    this.database = stateDb.openOpenClawStateDatabase({
-      env: { OPENCLAW_STATE_DIR: this.stateDir },
-    });
+    this.database = stateDb.openOpenClawStateDatabase({ env });
     this.store = envStore.createWorkerEnvironmentStore({ database: this.database });
     this.placementStore = placements.createWorkerSessionPlacementStore({
       database: this.database,
@@ -253,6 +252,7 @@ export class ComposedGatewayHarness {
         this.liveDeltas.push(event.data.delta);
       }
     });
+    this.restoreSessionTarget = bindWorkerFixtureSessionTarget(this.cfg, env);
   }
 
   get epoch(): number {
@@ -431,6 +431,7 @@ export class ComposedGatewayHarness {
   }
 
   async close(): Promise<void> {
+    using _ = { [Symbol.dispose]: this.restoreSessionTarget };
     this.transcriptGate?.release.resolve();
     for (const gate of this.liveEventGates) {
       gate.release.resolve();
