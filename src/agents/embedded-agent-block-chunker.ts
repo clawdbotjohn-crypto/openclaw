@@ -305,6 +305,10 @@ export class EmbeddedBlockChunker {
       preparedSourceBreaks.push(sourceStart + this.#buffer.length);
       emit(this.bufferedText, {
         sourceText: this.#buffer,
+        sourceGeneration: this.#sourceGeneration,
+        reconciledSourceBreak: reconciledSourceBreak || undefined,
+        sourceStart: this.#sourceOffset + this.#consumedLength,
+        sourceEnd: this.#sourceOffset + this.#consumedLength + this.#buffer.length,
         startsAtLineStart: Boolean(this.#reopenPrefix) || this.#bufferStartsAtLineStart,
       });
       this.#bufferStartsAtLineStart = this.#buffer.endsWith("\n");
