@@ -44,6 +44,7 @@ export function resolveModel(
   modelId: string,
   agentDir?: string,
   cfg?: OpenClawConfig,
+  discoveredModels: Model<Api>[] = [],
 ): {
   model?: Model<Api>;
   error?: string;
@@ -53,12 +54,15 @@ export function resolveModel(
   const resolvedAgentDir = agentDir ?? resolveOpenClawAgentDir();
   const authStorage = discoverAuthStorage(resolvedAgentDir);
   const modelRegistry = discoverModels(authStorage, resolvedAgentDir);
-  const model = modelRegistry.find(provider, modelId) as Model<Api> | null;
+  const normalizedProvider = normalizeProviderId(provider);
+  const discoveredModel = discoveredModels.find(
+    (entry) => normalizeProviderId(entry.provider) === normalizedProvider && entry.id === modelId,
+  );
+  const model = discoveredModel ?? (modelRegistry.find(provider, modelId) as Model<Api> | null);
 
   if (!model) {
     const providers = cfg?.models?.providers ?? {};
     const inlineModels = buildInlineProviderModels(providers);
-    const normalizedProvider = normalizeProviderId(provider);
     const inlineMatch = inlineModels.find(
       (entry) => normalizeProviderId(entry.provider) === normalizedProvider && entry.id === modelId,
     );
@@ -66,6 +70,15 @@ export function resolveModel(
       const normalized = normalizeModelCompat(inlineMatch as Model<Api>);
       return {
         model: normalized,
+        authStorage,
+        modelRegistry,
+      };
+    }
+    // Copilot live-only IDs require exact evidence from authenticated discovery.
+    // In particular, never let the generic configured-provider fallback invent one.
+    if (normalizedProvider === "github-copilot") {
+      return {
+        error: buildUnknownModelError(provider, modelId),
         authStorage,
         modelRegistry,
       };

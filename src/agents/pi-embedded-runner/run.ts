@@ -5,6 +5,7 @@ import { generateSecureToken } from "../../infra/secure-random.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type { PluginHookBeforeAgentStartResult } from "../../plugins/types.js";
 import { enqueueCommandInLane } from "../../process/command-queue.js";
+import { prepareGitHubCopilotModels } from "../../providers/github-copilot-model-discovery.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveOpenClawAgentDir } from "../agent-paths.js";
 import { hasConfiguredModelFallbacks } from "../agent-scope.js";
@@ -304,11 +305,20 @@ export async function runEmbeddedPiAgent(
         log.info(`[hooks] model overridden to ${modelId}`);
       }
 
+      const copilotDiscovery =
+        normalizeProviderId(provider) === "github-copilot"
+          ? await prepareGitHubCopilotModels({
+              cfg: params.config,
+              agentDir,
+              profileId: params.authProfileId,
+            })
+          : undefined;
       const { model, error, authStorage, modelRegistry } = resolveModel(
         provider,
         modelId,
         agentDir,
         params.config,
+        copilotDiscovery?.models ?? [],
       );
       if (!model) {
         throw new FailoverError(error ?? `Unknown model: ${provider}/${modelId}`, {

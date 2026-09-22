@@ -48,7 +48,9 @@ function cloneFirstTemplateModel(params: {
   return undefined;
 }
 
-const CODEX_GPT53_ELIGIBLE_PROVIDERS = new Set(["openai-codex", "github-copilot"]);
+// Copilot model IDs are account-scoped. They must come from authenticated live
+// discovery rather than this heuristic forward-compat path.
+const CODEX_GPT53_ELIGIBLE_PROVIDERS = new Set(["openai-codex"]);
 
 function resolveOpenAICodexGpt53FallbackModel(
   provider: string,

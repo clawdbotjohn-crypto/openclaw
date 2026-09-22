@@ -1,5 +1,6 @@
 import { type OpenClawConfig, loadConfig } from "../config/config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { prepareGitHubCopilotModels } from "../providers/github-copilot-model-discovery.js";
 import { resolveOpenClawAgentDir } from "./agent-paths.js";
 import { ensureOpenClawModelsJson } from "./models-config.js";
 
@@ -156,15 +157,41 @@ export function __setModelCatalogImportForTest(loader?: () => Promise<PiSdkModul
   importPiSdk = loader ?? defaultImportPiSdk;
 }
 
+async function appendLiveCopilotModels(
+  base: ModelCatalogEntry[],
+  config: OpenClawConfig | undefined,
+  agentDir: string,
+): Promise<ModelCatalogEntry[]> {
+  const discovery = await prepareGitHubCopilotModels({ cfg: config, agentDir });
+  if (discovery.status !== "success" && discovery.status !== "stale") {
+    return base;
+  }
+  const merged = new Map(base.map((entry) => [`${entry.provider}::${entry.id}`, entry]));
+  for (const model of discovery.models) {
+    merged.set(`${model.provider}::${model.id}`, {
+      id: model.id,
+      name: model.name,
+      provider: model.provider,
+      contextWindow: model.contextWindow,
+      reasoning: model.reasoning,
+      input: model.input as ModelInputType[],
+    });
+  }
+  return [...merged.values()].toSorted(
+    (a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name),
+  );
+}
+
 export async function loadModelCatalog(params?: {
   config?: OpenClawConfig;
   useCache?: boolean;
 }): Promise<ModelCatalogEntry[]> {
+  const agentDir = resolveOpenClawAgentDir();
   if (params?.useCache === false) {
     modelCatalogPromise = null;
   }
   if (modelCatalogPromise) {
-    return modelCatalogPromise;
+    return appendLiveCopilotModels(await modelCatalogPromise, params?.config, agentDir);
   }
 
   modelCatalogPromise = (async () => {
@@ -185,7 +212,6 @@ export async function loadModelCatalog(params?: {
       // we must not poison the cache with a rejected promise (otherwise all channel handlers
       // will keep failing until restart).
       const piSdk = await importPiSdk();
-      const agentDir = resolveOpenClawAgentDir();
       const { join } = await import("node:path");
       const authStorage = piSdk.discoverAuthStorage(agentDir);
       const registry = new (piSdk.ModelRegistry as unknown as {
@@ -240,7 +266,7 @@ export async function loadModelCatalog(params?: {
     }
   })();
 
-  return modelCatalogPromise;
+  return appendLiveCopilotModels(await modelCatalogPromise, params?.config, agentDir);
 }
 
 /**

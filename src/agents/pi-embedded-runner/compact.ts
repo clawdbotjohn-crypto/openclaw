@@ -15,6 +15,7 @@ import { getMachineDisplayName } from "../../infra/machine-name.js";
 import { generateSecureToken } from "../../infra/secure-random.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { type enqueueCommand, enqueueCommandInLane } from "../../process/command-queue.js";
+import { prepareGitHubCopilotModels } from "../../providers/github-copilot-model-discovery.js";
 import { isCronSessionKey, isSubagentSessionKey } from "../../routing/session-key.js";
 import { resolveSignalReactionLevel } from "../../signal/reaction-level.js";
 import { resolveTelegramInlineButtonsScope } from "../../telegram/inline-buttons.js";
@@ -273,11 +274,20 @@ export async function compactEmbeddedPiSessionDirect(
   };
   const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
   await ensureOpenClawModelsJson(params.config, agentDir);
+  const copilotDiscovery =
+    provider.toLowerCase() === "github-copilot"
+      ? await prepareGitHubCopilotModels({
+          cfg: params.config,
+          agentDir,
+          profileId: params.authProfileId,
+        })
+      : undefined;
   const { model, error, authStorage, modelRegistry } = resolveModel(
     provider,
     modelId,
     agentDir,
     params.config,
+    copilotDiscovery?.models ?? [],
   );
   if (!model) {
     const reason = error ?? `Unknown model: ${provider}/${modelId}`;

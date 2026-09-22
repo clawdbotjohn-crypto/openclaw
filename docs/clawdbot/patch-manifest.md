@@ -38,6 +38,45 @@ implemented reproducibly and tested. Preferred options, in order:
 
 Do not blindly copy generated JavaScript into the fork.
 
+### Authenticated GitHub Copilot live model discovery
+
+**Downstream implementation:** `clawdbot/copilot-live-model-discovery` semantically backports
+current upstream authenticated `GET {baseUrl}/models` discovery to the older v2026.3.2
+registry/runtime seams. It reuses the existing GitHub-token-to-Copilot-token exchange and the
+API base URL returned by that exchange. Account-visible, picker-enabled chat models with proven
+tool-call support are normalized in memory and shared by the model catalog, `models list`, and
+runtime resolution. The 30-second process cache is isolated by a hash of the source account token
+and normalized base URL, coalesces concurrent requests, and retains the last successful snapshot
+on transient failures. A successful 200 response is authoritative, including an empty/removal
+response. Short-lived bearers and discovered definitions are never written to config or
+`models.json`; `agents.defaults.models` remains an operator allowlist.
+
+**Upstream references:** semantic backport of OpenClaw commit
+`eb20f68c1e96309a76a05c124be1c93db85804a3`, especially
+`extensions/github-copilot/models.ts`, `dynamic-models.ts`, `model-metadata.ts`, and
+`src/plugin-sdk/provider-catalog-shared.ts`. This is intentionally not a cherry-pick because the
+pinned release predates provider plugins and live provider-catalog infrastructure.
+
+**Scope boundary:** this patch does not update `pi-ai`, generated models, or implement newer
+Claude adaptive-thinking/request behavior. Discovery only claims metadata supported by the live
+response and conservative transport-family mapping.
+
+**Rollback:** revert the focused live-discovery commit. The bundled v2026.3.2 registry remains the
+fallback, and no user files require migration or cleanup.
+
+**Verification evidence:**
+
+- `pnpm exec vitest run src/providers/github-copilot-model-discovery.test.ts src/providers/github-copilot-model-discovery.profile.test.ts src/agents/model-catalog.copilot.test.ts src/commands/models/list.registry.copilot.test.ts src/agents/pi-embedded-runner/model.test.ts` — 5 files, 29 tests passed.
+- `pnpm exec vitest run src/agents/pi-embedded-runner/model.forward-compat.test.ts` — 1 file, 6 tests passed.
+- `pnpm exec oxlint <12 touched TypeScript files>` — 0 warnings, 0 errors; `pnpm exec oxfmt --write <touched files>` and `git diff --check` passed.
+- `pnpm exec tsdown` — build passed (312-file and 321-file bundles completed in about 10 seconds each; only existing dynamic-import/plugin-timing warnings).
+- `pnpm exec tsgo --pretty false` reached only four pre-existing Feishu extension errors (`botName`, `PluginHookRunner`, missing `config/sessions/types.js`, and an implicit-any `trigger`); it reported no errors in touched files.
+
+**Retirement criteria:** remove this patch once the fork deliberately upgrades to an upstream
+release containing authenticated Copilot provider-catalog discovery plus runtime execution wiring,
+and equivalent account isolation, stale/error semantics, removal behavior, and focused tests pass
+without the downstream shim.
+
 ## Historical patches requiring re-verification
 
 These patches solved real problems, but their need and implementation must be checked
