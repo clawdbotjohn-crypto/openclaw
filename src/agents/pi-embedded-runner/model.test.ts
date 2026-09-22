@@ -380,3 +380,36 @@ describe("resolveModel", () => {
     expect(result.error).toBe("Unknown model: google-antigravity/some-model");
   });
 });
+
+describe("GitHub Copilot live model evidence", () => {
+  const discovered = {
+    id: "gpt-live-only",
+    name: "GPT Live Only",
+    provider: "github-copilot",
+    api: "openai-responses" as const,
+    baseUrl: "https://api.copilot.test",
+    reasoning: true,
+    input: ["text", "image"] as const,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 20_000,
+  };
+
+  it("resolves an exact live-only model from prepared account evidence", () => {
+    const result = resolveModel("github-copilot", discovered.id, "/tmp/agent", undefined, [
+      discovered,
+    ] as never);
+    expect(result.error).toBeUndefined();
+    expect(result.model).toMatchObject(discovered);
+  });
+
+  it("fails closed without evidence instead of using generic provider fallback", () => {
+    const result = resolveModel("github-copilot", discovered.id, "/tmp/agent", {
+      models: {
+        providers: { "github-copilot": { baseUrl: "https://api.copilot.test", models: [] } },
+      },
+    } as OpenClawConfig);
+    expect(result.model).toBeUndefined();
+    expect(result.error).toBe(`Unknown model: github-copilot/${discovered.id}`);
+  });
+});

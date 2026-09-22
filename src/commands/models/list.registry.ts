@@ -11,6 +11,7 @@ import {
 import { ensureOpenClawModelsJson } from "../../agents/models-config.js";
 import { discoverAuthStorage, discoverModels } from "../../agents/pi-model-discovery.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { prepareGitHubCopilotModels } from "../../providers/github-copilot-model-discovery.js";
 import {
   formatErrorWithStack,
   MODEL_AVAILABILITY_UNAVAILABLE_CODE,
@@ -100,6 +101,15 @@ export async function loadModelRegistry(cfg: OpenClawConfig) {
   const authStorage = discoverAuthStorage(agentDir);
   const registry = discoverModels(authStorage, agentDir);
   const models = registry.getAll();
+  const copilotDiscovery = await prepareGitHubCopilotModels({ cfg, agentDir });
+  if (copilotDiscovery.status === "success" || copilotDiscovery.status === "stale") {
+    const seen = new Set(models.map((model) => modelKey(model.provider, model.id)));
+    for (const model of copilotDiscovery.models) {
+      if (!seen.has(modelKey(model.provider, model.id))) {
+        models.push(model);
+      }
+    }
+  }
   let availableKeys: Set<string> | undefined;
   let availabilityErrorMessage: string | undefined;
 
@@ -116,6 +126,14 @@ export async function loadModelRegistry(cfg: OpenClawConfig) {
     availableKeys = undefined;
     if (!availabilityErrorMessage) {
       availabilityErrorMessage = formatErrorWithStack(err);
+    }
+  }
+  if (
+    availableKeys &&
+    (copilotDiscovery.status === "success" || copilotDiscovery.status === "stale")
+  ) {
+    for (const model of copilotDiscovery.models) {
+      availableKeys.add(modelKey(model.provider, model.id));
     }
   }
   return { registry, models, availableKeys, availabilityErrorMessage };
