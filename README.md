@@ -1,5 +1,8 @@
 # 🦞 OpenClaw — Personal AI Assistant
 
+> **Clawdbot fork owner recovery:** If the Pi bot/Gateway is dark and cannot answer,
+> start with **[Emergency recovery: Clawdbot is dark](docs/clawdbot/EMERGENCY-RECOVERY.md)**.
+
 <p align="center">
     <picture>
         <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.png">

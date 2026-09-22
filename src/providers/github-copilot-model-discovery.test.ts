@@ -77,6 +77,10 @@ describe("GitHub Copilot live model discovery", () => {
       maxTokens: 20_000,
       reasoning: true,
       input: ["text", "image"],
+      headers: expect.objectContaining({
+        "Editor-Version": "vscode/1.107.0",
+        "Copilot-Integration-Id": "vscode-chat",
+      }),
     });
     expect(() =>
       normalizeGitHubCopilotModelsResponse(
@@ -100,6 +104,18 @@ describe("GitHub Copilot live model discovery", () => {
       discoverGitHubCopilotModels(params),
     ]);
     expect(first).toEqual(concurrent);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.a.test/models",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer short-lived-secret",
+          "User-Agent": "GitHubCopilotChat/0.35.0",
+          "Editor-Version": "vscode/1.107.0",
+          "Editor-Plugin-Version": "copilot-chat/0.35.0",
+          "Copilot-Integration-Id": "vscode-chat",
+        }),
+      }),
+    );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     await discoverGitHubCopilotModels(params);
     expect(fetchImpl).toHaveBeenCalledTimes(1);

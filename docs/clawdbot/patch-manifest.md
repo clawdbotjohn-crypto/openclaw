@@ -47,8 +47,10 @@ API base URL returned by that exchange. Account-visible, picker-enabled chat mod
 tool-call support are normalized in memory and shared by the model catalog, `models list`, and
 runtime resolution. The 30-second process cache is isolated by a hash of the source account token
 and normalized base URL, coalesces concurrent requests, and retains the last successful snapshot
-on transient failures. A successful 200 response is authoritative, including an empty/removal
-response. Short-lived bearers and discovered definitions are never written to config or
+on transient failures. Requests identify as the same pinned VS Code Copilot Chat client used by
+pi-ai (`User-Agent`, editor/plugin version, and integration ID) for both discovery and inference;
+the real endpoint returns HTTP 400 without those compatibility headers. A successful 200 response is authoritative, including an
+empty/removal response. Short-lived bearers and discovered definitions are never written to config or
 `models.json`; `agents.defaults.models` remains an operator allowlist.
 
 **Upstream references:** semantic backport of OpenClaw commit
@@ -77,6 +79,23 @@ release containing authenticated Copilot provider-catalog discovery plus runtime
 and equivalent account isolation, stale/error semantics, removal behavior, and focused tests pass
 without the downstream shim.
 
+### Staged candidate installer and portable build checksum
+
+**Downstream implementation:** `scripts/clawdbot/install-candidate.sh` verifies a downloaded npm
+tarball checksum, validates package shape, creates a complete pre-install backup, installs into a
+separate prefix, validates that CLI, then performs a service/health-gated swap. Failed candidates
+are preserved and the immediately previous runtime is automatically restored and health-checked.
+It is validation-only by default; mutation requires `--apply --yes`, and the active global target
+also requires `--allow-live-runtime`. The package-build workflow records a portable checksum line
+using the tarball basename rather than a runner-absolute path.
+
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` covers no-mutation dry run,
+confirmation refusal, successful staged installation, and unhealthy-candidate automatic rollback
+against fake prefixes/services/health checks only.
+
+**Rollback:** revert the installer/workflow commit. This does not alter package runtime behavior,
+config schema, or user state. The independent manual `rollback-runtime.sh` recovery path remains.
+
 ## Historical patches requiring re-verification
 
 These patches solved real problems, but their need and implementation must be checked
@@ -101,7 +120,9 @@ Catalog recognition and request compatibility are separate. Adding a model ID do
 necessarily implement its required reasoning/request format. In particular, newer
 Anthropic models may require adaptive thinking rather than legacy budget-style
 `thinking.type=enabled`. Every model port needs basic tool-call and configured-reasoning
-probes before it is used in routing.
+probes before it is used in routing. The pinned pi-ai 0.55.3 handling and exact Claude Opus 4.8
+follow-up are documented in `claude-adaptive-thinking-follow-up.md`; it is separate from and does
+not block the OpenAI-responses-based Sol promotion.
 
 ## Update rule
 

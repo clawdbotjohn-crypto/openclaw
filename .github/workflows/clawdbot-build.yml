@@ -58,7 +58,7 @@ jobs:
           tarball="$(find artifacts -maxdepth 1 -type f -name '*.tgz' -print -quit)"
           test -n "$tarball"
           tarball="$(realpath "$tarball")"
-          sha256sum "$tarball" > "${tarball}.sha256"
+          (cd artifacts && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256")
           {
             echo "repository=${GITHUB_REPOSITORY}"
             echo "ref=${GITHUB_REF}"

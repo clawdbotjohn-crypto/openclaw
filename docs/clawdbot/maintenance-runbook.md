@@ -1,5 +1,8 @@
 # Clawdbot OpenClaw Maintenance Runbook
 
+> **Bot/Gateway dark?** John should start with the copy/paste owner guide:
+> **[Emergency recovery: Clawdbot is dark](./EMERGENCY-RECOVERY.md)**.
+
 ## Safety boundary
 
 The Raspberry Pi stays on the current global OpenClaw installation until John explicitly
@@ -33,16 +36,27 @@ or rebase the stable branch onto upstream.
 3. Run **Clawdbot fork package build** in GitHub Actions.
 4. Download and verify the tarball and SHA-256 file.
 5. Test the artifact in an isolated prefix/config. Do not point it at live state.
-6. Before any approved live installation, run:
+6. Validate the candidate installer plan. This is dry-run only and changes no files or
+   services:
 
    ```bash
-   cd ~/.openclaw/workspace/projects/openclaw-fork
-   scripts/clawdbot/backup-runtime.sh --yes
+   scripts/clawdbot/install-candidate.sh \
+     --artifact /path/to/openclaw-YYYY.M.D.tgz \
+     --checksum /path/to/openclaw-YYYY.M.D.tgz.sha256
    ```
 
-7. Record the archive path and checksum.
-8. Only after John's explicit approval, use a separately reviewed candidate installer.
-   This repository intentionally does not include an automatic live installer yet.
+7. Stop. A live attempt still requires John's explicit approval and must not run while any
+   worker is active. Only an approved operator may add all three mutation gates:
+   `--apply --yes --allow-live-runtime`.
+8. On an approved apply, the installer creates and verifies a fresh pre-install runtime
+   archive, stages and validates the npm package away from the target, swaps it, and checks
+   both the user service and health URL. An unhealthy candidate is moved to an
+   `openclaw.failed-*` directory and the immediately previous runtime is automatically
+   restored and health-checked. The failed candidate and backup archive remain for diagnosis.
+
+`install-candidate.sh` automatic rollback is the immediate failed-install path.
+`rollback-runtime.sh --archive ~/.openclaw/releases/current-good.tgz --yes` remains the
+independent manual disaster-recovery path; these are deliberately separate safeguards.
 
 ## Normal health checks
 
