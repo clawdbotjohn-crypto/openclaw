@@ -24,7 +24,7 @@ concurrency:
 jobs:
   package:
     name: Build and smoke-test package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -86,7 +86,7 @@ jobs:
             "$prefix/bin/openclaw" --help >/dev/null
 
       - name: Upload candidate artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: openclaw-clawdbot-${{ github.sha }}
           path: artifacts/
