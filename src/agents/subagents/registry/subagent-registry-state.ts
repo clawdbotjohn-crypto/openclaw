@@ -429,6 +429,7 @@ function getSubagentRunsSnapshot<T extends SubagentRunReadRecord>(
   cache: SubagentRunsCache<T>,
   scope?: {
     load?: () => Iterable<T>;
+    selectCached?: (lookup: SubagentSessionReadLookup) => readonly string[];
     fresh?: boolean;
     borrowPersisted?: boolean;
     matches: (entry: SubagentRunReadRecord) => boolean;
@@ -439,8 +440,15 @@ function getSubagentRunsSnapshot<T extends SubagentRunReadRecord>(
     try {
       // Scoped reads use indexed SQL until a complete owner snapshot is available.
       const cached = scope?.load && !scope.fresh ? getPersistedSubagentRunsSnapshot(cache) : null;
+      const cachedRows =
+        cached && scope?.selectCached
+          ? indexedSnapshotRows(
+              cached,
+              scope.selectCached(expectDefined(getSessionListLookup(cache), "subagent lookup")),
+            )
+          : cached?.values();
       const persisted = scope?.load
-        ? (cached?.values() ?? scope.load())
+        ? (cachedRows ?? scope.load())
         : loadPersistedSubagentRunsForRead(cache).values();
       for (const entry of persisted) {
         if (!scope || scope.matches(entry)) {
@@ -575,14 +583,8 @@ export function getSubagentSessionListRunsSnapshotForRead(
     }
     const cache = persistedSubagentSessionListRunsReadCache;
     return getSubagentRunsSnapshot(inMemoryRuns, cache, {
-      fresh: true,
-      load: () => {
-        const cached = getPersistedSubagentRunsSnapshot(cache);
-        const lookup = cached ? getSessionListLookup(cache) : undefined;
-        return cached && lookup
-          ? indexedSnapshotRows(cached, lookup.selectControllers(keys))
-          : loadSubagentSessionListRunsFromSqlite([...keys]).values();
-      },
+      selectCached: (lookup) => lookup.selectControllers(keys),
+      load: () => loadSubagentSessionListRunsFromSqlite([...keys]).values(),
       matches: (entry) => keys.has(entry.controllerSessionKey?.trim() || entry.requesterSessionKey),
     });
   }
@@ -681,6 +683,7 @@ export function getSubagentRunsSnapshotForController(
     return new Map();
   }
   return getSubagentRunsSnapshot(inMemoryRuns, persistedSubagentRunsReadCache, {
+    selectCached: (lookup) => lookup.selectControllers(new Set([key])),
     load: () => loadSubagentRunsForControllerFromSqlite(key),
     matches: (entry) => (entry.controllerSessionKey?.trim() || entry.requesterSessionKey) === key,
   });
@@ -715,6 +718,7 @@ export function getSubagentRunsSnapshotForChildSession(
     return new Map();
   }
   return getSubagentRunsSnapshot(inMemoryRuns, persistedSubagentRunsReadCache, {
+    selectCached: (lookup) => lookup.selectChildren(new Set([key])),
     load: () => loadSubagentRunsForChildSessionFromSqlite(key),
     matches: (entry) => entry.childSessionKey === key,
   });
