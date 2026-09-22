@@ -514,6 +514,7 @@ src/gateway/control-ui-session-prs-landing.ts
 src/gateway/github-remote.ts
 src/gateway/operator-scopes.ts
 src/gateway/server-methods/workspace-fs.ts
+src/gateway/worker-environments/session-attachment.ts
 src/gateway/worker-environments/workspace-actual-manifest.ts
 src/gateway/worker-environments/workspace-hash-memo.ts
 src/gateway/worker-environments/workspace-inventory-computation.runtime.ts
@@ -805,6 +806,7 @@ src/infra/worker-task-pool.ts
 src/infra/worker-task-server.ts
 src/infra/worker-transfer-bytes.ts
 src/infra/wsl.ts
+src/infra/zstd-codec.ts
 src/logger.ts
 src/logging/config.ts
 src/logging/console.ts
