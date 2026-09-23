@@ -50,8 +50,24 @@ while (($#)); do
 done
 $CONFIRMED || { echo "Refusing rollback without --yes." >&2; exit 2; }
 [[ -f "$ARCHIVE" ]] || { echo "Archive not found: $ARCHIVE" >&2; exit 1; }
-ARCHIVE="$(readlink -f "$ARCHIVE")"
-CHECKSUM="$(readlink -f "${CHECKSUM:-${ARCHIVE}.sha256}")"
+SOURCE_ARCHIVE="$(readlink -f "$ARCHIVE")"
+SOURCE_CHECKSUM="${CHECKSUM:-${SOURCE_ARCHIVE}.sha256}"
+[[ -f "$SOURCE_CHECKSUM" ]] || { echo "Checksum file is required: $SOURCE_CHECKSUM" >&2; exit 1; }
+SOURCE_CHECKSUM="$(readlink -f "$SOURCE_CHECKSUM")"
+archive_snapshot_dir=""
+cleanup_archive_snapshot() {
+  [[ -z "$archive_snapshot_dir" ]] || rm -rf -- "$archive_snapshot_dir"
+  archive_snapshot_dir=""
+}
+trap cleanup_archive_snapshot EXIT
+archive_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-rollback-archive.XXXXXX")"
+chmod 700 "$archive_snapshot_dir"
+mkdir -m 700 "$archive_snapshot_dir/archive" "$archive_snapshot_dir/inputs"
+ARCHIVE="$archive_snapshot_dir/archive/$(basename "$SOURCE_ARCHIVE")"
+CHECKSUM="$archive_snapshot_dir/inputs/checksum.sha256"
+cp -- "$SOURCE_ARCHIVE" "$ARCHIVE"
+cp -- "$SOURCE_CHECKSUM" "$CHECKSUM"
+chmod 600 "$ARCHIVE" "$CHECKSUM"
 runtime_validate_checksum "$ARCHIVE" "$CHECKSUM"
 [[ "$RUNTIME_HEALTH_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$RUNTIME_HEALTH_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid health settings." >&2; exit 2; }
 [[ "$RUNTIME_HEALTH_INTERVAL_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Invalid health interval." >&2; exit 2; }
@@ -129,13 +145,16 @@ restore_original() {
 abort_transaction() {
   local source="$1" rc="$2"
   trap - ERR INT TERM EXIT
-  if $transaction_active; then restore_original "$source" || exit 3; fi
+  if $transaction_active; then
+    if ! restore_original "$source"; then cleanup_archive_snapshot; exit 3; fi
+  fi
+  cleanup_archive_snapshot
   case "$source" in INT) exit 130 ;; TERM) exit 143 ;; *) exit "$rc" ;; esac
 }
 trap 'abort_transaction ERR $?' ERR
 trap 'abort_transaction INT 130' INT
 trap 'abort_transaction TERM 143' TERM
-trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; fi' EXIT
+trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; else cleanup_archive_snapshot; fi' EXIT
 
 transaction_active=true
 runtime_test_hook before-stop
@@ -162,6 +181,7 @@ fi
 
 transaction_active=false
 trap - ERR INT TERM EXIT
+cleanup_archive_snapshot
 echo "Rollback succeeded only after active path and required service state verification."
 echo "Preserved replaced runtime at: $replaced"
-echo "Restored archive: $ARCHIVE"
+echo "Restored archive: $SOURCE_ARCHIVE"

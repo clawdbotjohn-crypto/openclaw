@@ -75,9 +75,27 @@ done
 [[ -n "$EXPECTED_REPOSITORY" && -n "$EXPECTED_REF" && -n "$EXPECTED_SHA" ]] || {
   echo "Explicit --expected-repository, --expected-ref, and --expected-sha are required." >&2; exit 2;
 }
-ARTIFACT="$(readlink -f "$ARTIFACT")"
-CHECKSUM="$(readlink -f "${CHECKSUM:-${ARTIFACT}.sha256}")"
-METADATA="$(readlink -f "$METADATA")"
+SOURCE_ARTIFACT="$(readlink -f "$ARTIFACT")"
+SOURCE_CHECKSUM="${CHECKSUM:-${SOURCE_ARTIFACT}.sha256}"
+[[ -f "$SOURCE_CHECKSUM" ]] || { echo "Checksum file is required: $SOURCE_CHECKSUM" >&2; exit 1; }
+SOURCE_CHECKSUM="$(readlink -f "$SOURCE_CHECKSUM")"
+SOURCE_METADATA="$(readlink -f "$METADATA")"
+artifact_snapshot_dir=""
+cleanup_artifact_snapshot() {
+  [[ -z "$artifact_snapshot_dir" ]] || rm -rf -- "$artifact_snapshot_dir"
+  artifact_snapshot_dir=""
+}
+trap cleanup_artifact_snapshot EXIT
+artifact_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-install-artifact.XXXXXX")"
+chmod 700 "$artifact_snapshot_dir"
+mkdir -m 700 "$artifact_snapshot_dir/artifact" "$artifact_snapshot_dir/inputs"
+ARTIFACT="$artifact_snapshot_dir/artifact/$(basename "$SOURCE_ARTIFACT")"
+CHECKSUM="$artifact_snapshot_dir/inputs/checksum.sha256"
+METADATA="$artifact_snapshot_dir/inputs/build-metadata.txt"
+cp -- "$SOURCE_ARTIFACT" "$ARTIFACT"
+cp -- "$SOURCE_CHECKSUM" "$CHECKSUM"
+cp -- "$SOURCE_METADATA" "$METADATA"
+chmod 600 "$ARTIFACT" "$CHECKSUM" "$METADATA"
 runtime_validate_checksum "$ARTIFACT" "$CHECKSUM"
 runtime_validate_provenance "$METADATA" "$EXPECTED_REPOSITORY" "$EXPECTED_REF" "$EXPECTED_SHA" "$ARTIFACT" "$RUNTIME_VALIDATED_SHA256"
 [[ "$RUNTIME_HEALTH_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$RUNTIME_HEALTH_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid health settings." >&2; exit 2; }
@@ -107,8 +125,8 @@ is_live=false
 [[ "$(readlink -f "$RUNTIME_DIR")" == "$(readlink -f "$GLOBAL_RUNTIME")" ]] && is_live=true
 cat <<PLAN
 Candidate install plan
-  artifact:       $ARTIFACT
-  artifact sha:   $RUNTIME_VALIDATED_SHA256
+  artifact source: $SOURCE_ARTIFACT
+  artifact sha:    $RUNTIME_VALIDATED_SHA256 (private validated snapshot)
   repository:     $EXPECTED_REPOSITORY
   ref / sha:      $EXPECTED_REF @ $EXPECTED_SHA
   target runtime: $RUNTIME_DIR
@@ -192,13 +210,16 @@ restore_previous() {
 abort_transaction() {
   local source="$1" rc="$2"
   trap - ERR INT TERM EXIT
-  if $transaction_active; then restore_previous "$source" || exit 3; fi
+  if $transaction_active; then
+    if ! restore_previous "$source"; then cleanup_artifact_snapshot; exit 3; fi
+  fi
+  cleanup_artifact_snapshot
   case "$source" in INT) exit 130 ;; TERM) exit 143 ;; *) exit "$rc" ;; esac
 }
 trap 'abort_transaction ERR $?' ERR
 trap 'abort_transaction INT 130' INT
 trap 'abort_transaction TERM 143' TERM
-trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; fi' EXIT
+trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; else cleanup_artifact_snapshot; fi' EXIT
 
 transaction_active=true
 runtime_test_hook before-stop
@@ -225,6 +246,7 @@ fi
 
 transaction_active=false
 trap - ERR INT TERM EXIT
+cleanup_artifact_snapshot
 rm -rf "$stage_prefix"
 echo "Candidate installation succeeded; active path and required service state were verified."
 echo "Pre-install archive: $backup_archive"

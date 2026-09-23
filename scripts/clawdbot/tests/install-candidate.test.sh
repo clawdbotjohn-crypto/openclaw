@@ -13,6 +13,10 @@ assert() { "$@" || { echo "assertion failed: $*" >&2; return 1; }; }
 cleanup_case() { [[ -n "$case_root" ]] && rm -rf "$case_root"; case_root=""; }
 trap cleanup_case EXIT
 
+runtime_tree_digest() {
+  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -C "$1" -cf - . | sha256sum | awk '{print $1}'
+}
+
 make_cli() {
   local runtime="$1" version="$2" marker="$3"
   mkdir -p "$runtime"
@@ -79,10 +83,13 @@ setup_case() {
   unset META_REPOSITORY META_REF META_SHA META_EVENT META_PACKAGE_SHA || true
   case_root="$(mktemp -d /tmp/openclaw-transaction-test.XXXXXX)"
   PREFIX="$case_root/prefix"; RUNTIME="$PREFIX/lib/node_modules/openclaw"; RELEASES="$case_root/releases"; FAKES="$case_root/fakes"
-  mkdir -p "$PREFIX/bin" "$RELEASES" "$FAKES"
+  mkdir -p "$PREFIX/bin" "$RELEASES" "$FAKES" "$case_root/tmp"
   make_cli "$RUNTIME" 1.0.0 "original-exact-$RANDOM-$RANDOM"
   ORIGINAL_MARKER="$(cat "$RUNTIME/exact-runtime-marker")"
+  ORIGINAL_RUNTIME_DIGEST="$(runtime_tree_digest "$RUNTIME")"
+  ORIGINAL_RUNTIME_ID="$(stat -c '%d:%i' "$RUNTIME")"
   ln -s ../lib/node_modules/openclaw/openclaw.mjs "$PREFIX/bin/openclaw"
+  ORIGINAL_BIN_TARGET="$(readlink "$PREFIX/bin/openclaw")"
   SERVICE_STATE="$case_root/service-state"; echo "${1:-active}" > "$SERVICE_STATE"
   cat > "$FAKES/systemctl" <<'SYSTEMCTL'
 #!/usr/bin/env bash
@@ -115,13 +122,37 @@ NPM
 echo "TEST FAILURE: curl must never be called" >&2
 exit 99
 CURL
+  local real_sha256sum
+  real_sha256sum="$(command -v sha256sum)"
+  cat > "$FAKES/sha256sum" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "\${FAKE_SNAPSHOT_SOURCE:-}" && -n "\${FAKE_REPLACEMENT_ARCHIVE:-}" && -n "\${FAKE_SNAPSHOT_REPLACED_MARKER:-}" && \$# -eq 1 ]]; then
+  source_path="\$(readlink -f -- "\$FAKE_SNAPSHOT_SOURCE")"
+  input_path="\$(readlink -f -- "\$1")"
+  if [[ "\$input_path" != "\$source_path" && "\$(basename "\$input_path")" == "\$(basename "\$source_path")" && ! -e "\$FAKE_SNAPSHOT_REPLACED_MARKER" ]]; then
+    cp -- "\$FAKE_REPLACEMENT_ARCHIVE" "\${source_path}.replacement.\$\$"
+    mv -- "\${source_path}.replacement.\$\$" "\$source_path"
+    : > "\$FAKE_SNAPSHOT_REPLACED_MARKER"
+  fi
+fi
+exec "$real_sha256sum" "\$@"
+EOF
   chmod +x "$FAKES"/*
   create_candidate_artifact "$case_root"
   create_restore_archive "$case_root"
+  EVIL_CANDIDATE="$case_root/evil-candidate.tgz"
+  mkdir -p "$case_root/evil-candidate/package"
+  make_cli "$case_root/evil-candidate/package" 9.9.1 attacker-candidate
+  tar -C "$case_root/evil-candidate" -czf "$EVIL_CANDIDATE" package
+  EVIL_RESTORE_ARCHIVE="$case_root/evil-restore.tgz"
+  mkdir -p "$case_root/evil-restore/openclaw"
+  make_cli "$case_root/evil-restore/openclaw" 9.9.2 attacker-restore
+  tar -C "$case_root/evil-restore" -czf "$EVIL_RESTORE_ARCHIVE" openclaw
 }
 
 common_env() {
-  env PATH="$FAKES:$PATH" \
+  env PATH="$FAKES:$PATH" TMPDIR="$case_root/tmp" \
     OPENCLAW_SYSTEMCTL_BIN="$FAKES/systemctl" OPENCLAW_NPM_BIN="$FAKES/npm" \
     OPENCLAW_HEALTH_BIN="$PREFIX/bin/openclaw" OPENCLAW_HEALTH_ATTEMPTS=1 OPENCLAW_HEALTH_INTERVAL_SECONDS=0 \
     FAKE_SERVICE_STATE="$SERVICE_STATE" FAKE_GLOBAL_PREFIX="$case_root/not-global" \
@@ -137,8 +168,15 @@ install_cmd() {
 rollback_cmd() {
   common_env "$rollback" --archive "$RESTORE_ARCHIVE" --runtime-dir "$RUNTIME" --release-dir "$RELEASES" --yes
 }
+assert_snapshot_staging_cleaned() {
+  assert test -z "$(find "$case_root/tmp" -mindepth 1 -maxdepth 1 -type d \( -name 'openclaw-install-artifact.*' -o -name 'openclaw-rollback-archive.*' \) -print -quit)"
+}
+
 assert_original_restored() {
   assert test "$(cat "$RUNTIME/exact-runtime-marker")" = "$ORIGINAL_MARKER" || return
+  assert test "$(runtime_tree_digest "$RUNTIME")" = "$ORIGINAL_RUNTIME_DIGEST" || return
+  assert test "$(stat -c '%d:%i' "$RUNTIME")" = "$ORIGINAL_RUNTIME_ID" || return
+  assert test "$(readlink "$PREFIX/bin/openclaw")" = "$ORIGINAL_BIN_TARGET" || return
   assert test "$(readlink -f "$PREFIX/bin/openclaw")" = "$(readlink -f "$RUNTIME/openclaw.mjs")" || return
   assert test "$(cat "$SERVICE_STATE")" = "$1" || return
 }
@@ -162,7 +200,8 @@ test_dry_run() {
     --prefix "$PREFIX" --runtime-dir "$RUNTIME" --release-dir "$RELEASES" >/dev/null
   assert_original_restored active || return
   after="$(find "$RELEASES" -name '*.tgz' | wc -l)"
-  assert test "$before" = "$after"
+  assert test "$before" = "$after" || return
+  assert_snapshot_staging_cleaned
 }
 
 test_install_success_running() {
@@ -228,15 +267,33 @@ test_rollback_success_stopped() {
   assert test "$(readlink -f "$PREFIX/bin/openclaw")" = "$(readlink -f "$RUNTIME/openclaw.mjs")"
 }
 
-test_stopped_failure_recovers_stopped() {
-  setup_case inactive
-  if OPENCLAW_TEST_HOOK_PHASE=after-link OPENCLAW_TEST_HOOK_MODE=ERR install_cmd >/dev/null 2>&1; then return 1; fi
-  assert_original_restored inactive
+test_install_source_replacement_uses_snapshot() {
+  setup_case active
+  local replaced="$case_root/install-source-replaced"
+  FAKE_SNAPSHOT_SOURCE="$ARTIFACT" FAKE_REPLACEMENT_ARCHIVE="$EVIL_CANDIDATE" \
+    FAKE_SNAPSHOT_REPLACED_MARKER="$replaced" install_cmd >/dev/null
+  assert test -e "$replaced" || return
+  assert test "$(tar -xOzf "$ARTIFACT" package/exact-runtime-marker)" = attacker-candidate || return
+  assert test "$(cat "$RUNTIME/exact-runtime-marker")" = candidate-exact || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert_snapshot_staging_cleaned
+}
+
+test_rollback_source_replacement_uses_snapshot() {
+  setup_case active
+  local replaced="$case_root/rollback-source-replaced"
+  FAKE_SNAPSHOT_SOURCE="$RESTORE_ARCHIVE" FAKE_REPLACEMENT_ARCHIVE="$EVIL_RESTORE_ARCHIVE" \
+    FAKE_SNAPSHOT_REPLACED_MARKER="$replaced" rollback_cmd >/dev/null
+  assert test -e "$replaced" || return
+  assert test "$(tar -xOzf "$RESTORE_ARCHIVE" openclaw/exact-runtime-marker)" = attacker-restore || return
+  assert test "$(cat "$RUNTIME/exact-runtime-marker")" = known-good-exact || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert_snapshot_staging_cleaned
 }
 
 test_hook_matrix() {
-  local tool="$1" phase="$2" mode="$3"
-  setup_case active
+  local tool="$1" phase="$2" mode="$3" initial_state="${4:-active}"
+  setup_case "$initial_state"
   local rc=0
   if [[ "$tool" == install ]]; then
     OPENCLAW_TEST_HOOK_PHASE="$phase" OPENCLAW_TEST_HOOK_MODE="$mode" install_cmd >/dev/null 2>&1 || rc=$?
@@ -244,8 +301,9 @@ test_hook_matrix() {
     OPENCLAW_TEST_HOOK_PHASE="$phase" OPENCLAW_TEST_HOOK_MODE="$mode" rollback_cmd >/dev/null 2>&1 || rc=$?
   fi
   (( rc != 0 )) || return 1
-  assert_original_restored active
-  case "$mode" in INT) assert test "$rc" -eq 130 ;; TERM) assert test "$rc" -eq 143 ;; esac
+  assert_original_restored "$initial_state" || return
+  case "$mode" in INT) assert test "$rc" -eq 130 || return ;; TERM) assert test "$rc" -eq 143 || return ;; esac
+  assert_snapshot_staging_cleaned
 }
 
 test_shared_lock_contention() {
@@ -324,7 +382,8 @@ run_case "backup creation failure preserves known-good" test_backup_failure_pres
 run_case "candidate health failure restores exact runtime" test_install_health_failure_recovers
 run_case "rollback health failure restores exact runtime" test_rollback_health_failure_recovers
 run_case "stopped rollback succeeds without starting service" test_rollback_success_stopped
-run_case "stopped-state failure restores stopped state" test_stopped_failure_recovers_stopped
+run_case "installer consumes validated snapshot after source replacement" test_install_source_replacement_uses_snapshot
+run_case "rollback consumes validated snapshot after source replacement" test_rollback_source_replacement_uses_snapshot
 run_case "shared lock blocks installer and rollback" test_shared_lock_contention
 run_case "smoke test requires structured health schema" test_smoke_structured_health
 run_case "standalone backup refuses unhealthy baseline" test_backup_refuses_unhealthy_baseline
@@ -332,9 +391,13 @@ run_case "pointer promotion failure restores all known-good pointers" test_backu
 
 install_phases=(before-stop after-stop after-move-original after-activate-candidate after-link after-start after-health)
 rollback_phases=(before-stop after-stop after-move-original after-activate-restored after-link after-start after-health)
+install_stopped_phases=(before-stop after-stop after-move-original after-activate-candidate after-link after-stopped-verify)
+rollback_stopped_phases=(before-stop after-stop after-move-original after-activate-restored after-link after-stopped-verify)
 for mode in ERR INT TERM EXIT; do
-  for phase in "${install_phases[@]}"; do run_case "installer recovers $mode at $phase" test_hook_matrix install "$phase" "$mode"; done
-  for phase in "${rollback_phases[@]}"; do run_case "rollback recovers $mode at $phase" test_hook_matrix rollback "$phase" "$mode"; done
+  for phase in "${install_phases[@]}"; do run_case "installer recovers $mode at $phase" test_hook_matrix install "$phase" "$mode" active; done
+  for phase in "${rollback_phases[@]}"; do run_case "rollback recovers $mode at $phase" test_hook_matrix rollback "$phase" "$mode" active; done
+  for phase in "${install_stopped_phases[@]}"; do run_case "stopped installer recovers $mode at $phase" test_hook_matrix install "$phase" "$mode" inactive; done
+  for phase in "${rollback_stopped_phases[@]}"; do run_case "stopped rollback recovers $mode at $phase" test_hook_matrix rollback "$phase" "$mode" inactive; done
 done
 for tool in install rollback; do
   for kind in missing malformed ambiguous mismatch misnamed; do run_case "$tool rejects $kind checksum" test_checksum_failure "$kind" "$tool"; done

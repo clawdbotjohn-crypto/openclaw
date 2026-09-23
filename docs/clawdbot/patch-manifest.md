@@ -84,18 +84,22 @@ without the downstream shim.
 **Downstream implementation:** `scripts/clawdbot/install-candidate.sh` fails closed on an exact,
 single-record tarball checksum and exact `build-metadata.txt` repository/promotable branch ref/
 post-merge SHA/push event/tarball checksum. Pull refs and PR artifacts are not promotable. It
-validates package shape and isolated CLI execution, then uses the same runtime lock as backup and
-manual rollback. A running baseline must pass parsed `openclaw health --json` WebSocket RPC before
-a validated complete archive transactionally replaces known-good pointers. The candidate swap has
-phase-aware ERR/INT/TERM/EXIT recovery that restores the exact prior runtime/path and prior
-running/stopped service state. It is validation-only by default; mutation requires `--apply --yes`,
-and the active global target also requires `--allow-live-runtime`. Promotion remains post-merge.
+copies the artifact, checksum, and provenance into a private transaction-owned snapshot, validates
+that snapshot's package shape and isolated CLI execution, and passes only the snapshot to npm. The
+same runtime lock is shared with backup and manual rollback; rollback likewise validates, lists, and
+extracts only a private archive snapshot. A running baseline must pass parsed `openclaw health
+--json` WebSocket RPC before a validated complete archive transactionally replaces known-good
+pointers. Candidate install and rollback have phase-aware ERR/INT/TERM/EXIT recovery that restores
+the exact prior runtime/path and prior running/stopped service state. The installer is validation-only
+by default; mutation requires `--apply --yes`, and the active global target also requires
+`--allow-live-runtime`. Promotion remains post-merge.
 
-**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 85 isolated fake-environment
-cases: every installer/rollback mutation boundary crossed with ERR/INT/TERM/EXIT (including the
-post-move/pre-bookkeeping signal windows), structured-health failure, exact runtime and
-running/stopped state restoration, shared lock contention, known-good preservation and pointer
-transaction failure, and checksum/provenance rejection. Fake `systemctl`, npm, CLI, and `/tmp`
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 134 isolated fake-environment
+cases: every applicable running and stopped installer/rollback mutation boundary crossed with
+ERR/INT/TERM/EXIT (including post-move/pre-bookkeeping and `after-stopped-verify`), exact runtime
+content/inode/path and service-state restoration, source replacement after private snapshot,
+structured-health failure, shared lock contention, known-good preservation and pointer transaction
+failure, and checksum/provenance rejection. Fake `systemctl`, npm, CLI, `sha256sum`, and `/tmp`
 directories prevent any test from reaching live state.
 
 **Rollback:** revert the installer/workflow commit. This does not alter package runtime behavior,
