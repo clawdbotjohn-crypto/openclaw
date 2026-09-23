@@ -67,7 +67,7 @@
      --yes
    ```
 
-   The script fails closed on missing/malformed/ambiguous/mismatched checksums, shares a lock with backup/install, preserves the exact prior runtime and running/stopped state, and only reports success after active-path and required structured-health verification. If it reports any failure, **stop and escalate**. Do not extract, rename, symlink, or replace the package manually. Do not use `install-candidate.sh` as disaster recovery.
+   The script fails closed on missing/malformed/ambiguous/mismatched checksums and on an archive-list producer that prints plausible names but exits nonzero. It shares a lock with backup/install and requires two exact service proofs (`LoadState=loaded`, then `active`/0 or `inactive`/3) before mutation; failed/transitioning/unknown/malformed/query-error states are not treated as stopped. It uses a private 0700 transaction to preserve the exact prior runtime inode/path/bytes and active/inactive state, and only reports success after active-path and required structured-health verification. If stop/start/recovery or any verification fails, recovery material is retained and the failure is loud: **stop and escalate**. Do not extract, rename, symlink, or replace the package manually. Do not use `install-candidate.sh` as disaster recovery.
 
 6. **Run final verification and stop on any failure.**
 

@@ -87,20 +87,33 @@ post-merge SHA/push event/tarball checksum. Pull refs and PR artifacts are not p
 copies the artifact, checksum, and provenance into a private transaction-owned snapshot, validates
 that snapshot's package shape and isolated CLI execution, and passes only the snapshot to npm. The
 same runtime lock is shared with backup and manual rollback; rollback likewise validates, lists, and
-extracts only a private archive snapshot. A running baseline must pass parsed `openclaw health
---json` WebSocket RPC before a validated complete archive transactionally replaces known-good
-pointers. Candidate install and rollback have phase-aware ERR/INT/TERM/EXIT recovery that restores
-the exact prior runtime/path and prior running/stopped service state. The installer is validation-only
-by default; mutation requires `--apply --yes`, and the active global target also requires
-`--allow-live-runtime`. Promotion remains post-merge.
+extracts only a private archive snapshot. Archive listing is captured to a private file and its producer
+exit status must succeed before any entry is trusted. Service state is tri-state and fail-closed: an exact
+`LoadState=loaded` proof plus exact `active`/0 or `inactive`/3 is required; failed, transitioning,
+unknown, malformed, timeout, permission, and query-error states abort before mutation.
 
-**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 134 isolated fake-environment
+Promotable backup health is cryptographically/tree bound rather than caller-asserted: the supplied CLI
+must canonically resolve to the selected runtime's own entrypoint, a stable private snapshot is made,
+the executable inside that exact snapshot performs parsed `openclaw health --json` WebSocket RPC,
+and pre/post tree digests reject mutation before that tree is archived. Known-good promotion uses a
+private journal, exact copies of every old pointer type/absence, atomic renames, and an atomic commit
+marker. Pre-commit ERR/INT/TERM/EXIT recovery is reconciled from filesystem/journal state; restore
+failure retains the complete journal and fails loudly. Installer and rollback use exclusive 0700
+transaction directories for staged/previous/failed/recovery paths and retain recovery material when
+service stop/start restoration cannot be proven. The installer is validation-only by default; mutation
+requires `--apply --yes`, and the active global target also requires `--allow-live-runtime`. Promotion
+remains post-merge.
+
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 194 isolated fake-environment
 cases: every applicable running and stopped installer/rollback mutation boundary crossed with
-ERR/INT/TERM/EXIT (including post-move/pre-bookkeeping and `after-stopped-verify`), exact runtime
-content/inode/path and service-state restoration, source replacement after private snapshot,
-structured-health failure, shared lock contention, known-good preservation and pointer transaction
-failure, and checksum/provenance rejection. Fake `systemctl`, npm, CLI, `sha256sum`, and `/tmp`
-directories prevent any test from reaching live state.
+ERR/INT/TERM/EXIT; exact runtime content/inode/path, pointer bytes/link/absence, lock, and service
+state assertions; active/inactive and every fail-closed service-state class; stop/start and
+recovery-stop/recovery-start failure; same-runtime and A-vs-B health binding, aliases, symlink escape,
+and source mutation; private collision-proof transactions; producer-failing plausible archive lists;
+and immediately-before/immediately-after every pointer rename, restore failure, repeated recovery
+signals, and post-commit reconciliation. Checksum/provenance and structured-health gates remain
+covered. Fake `systemctl`, npm, CLI, archive tools, and `/tmp` directories prevent tests from reaching
+live state.
 
 **Rollback:** revert the installer/workflow commit. This does not alter package runtime behavior,
 config schema, or user state. For an operational outage, use only the independent transactional
