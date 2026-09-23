@@ -1,119 +1,99 @@
 # Emergency recovery: Clawdbot is dark
 
-**Owner guide for John. Start here when the bot/Gateway cannot answer.** This is recovery only—not an update procedure. Do not run `npm install -g`, `openclaw update`, a candidate installer, or any GitHub deployment workflow.
+**Owner guide for John. This is the single authoritative maintenance/emergency route.** Recovery is not permission to update. Do not run `npm install -g`, `openclaw update`, the candidate installer, a deployment workflow, or a manual package-replacement fallback.
 
-## Emergency checklist (do this first)
+## Numbered owner-safe route
 
-1. From your laptop, connect to Tailscale and open PowerShell/Terminal.
-2. SSH to the Pi:
+1. **Connect only to the current Pi Tailnet identity.** On the laptop, connect Tailscale and run:
 
    ```bash
-   ssh john@clawdbot-pi
+   ssh john@clawdbot-pi-1.tail400409.ts.net
    ```
 
-   If name resolution fails, use the **currently verified 2026-09-22** Tailscale address (it may become stale):
+   If current MagicDNS resolution fails, use the current address:
 
    ```bash
    ssh john@100.126.230.66
    ```
 
-   Expected: a shell prompt on host `clawdbot-pi`. SSH asks for host-key confirmation only on a first connection; it must not show a different hostname unexpectedly.
+   **Warning:** the former Tailnet name `clawdbot-pi` and its former peer/address are stale/expired. Do not use, trust, or revive that old Tailnet node. The Pi's local shell hostname may still print `clawdbot-pi`; that is not the stale Tailnet identity.
 
-3. Run this read-only triage block:
+   If neither current route reaches the expected Pi, stop this procedure and go to step 7. Do not accept an unexpected host key or operate on a different machine.
+
+2. **Collect read-only triage.** From the fork checkout:
 
    ```bash
+   cd ~/.openclaw/workspace/projects/openclaw-fork
    hostname
    systemctl --user is-active openclaw-gateway.service
    systemctl --user status openclaw-gateway.service --no-pager -n 30
-   curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18789/healthz
    journalctl --user -u openclaw-gateway.service -n 80 --no-pager
+   scripts/clawdbot/smoke-test.sh --binary "$(command -v openclaw)" --gateway
    ```
 
-   Healthy expected results:
-   - hostname: `clawdbot-pi`
-   - service: `active`
-   - health: `{"ok":true,"status":"live"}` (extra fields are okay)
+   The smoke script uses the supported WebSocket RPC command `openclaw health --json --timeout …`, parses the JSON, and requires healthy structured fields including `ok: true`; an HTTP 200 or CLI exit code alone is not accepted.
 
-4. Choose exactly one path below:
-   - explicit JSON/schema/config errors → **Config failure**
-   - missing/corrupt OpenClaw files, import/syntax/startup errors with valid config → **Runtime failure**
-   - no SSH or Pi does not respond → **Whole-Pi/network failure**
-5. Run the final verification block. If it does not pass, **stop rather than improvising**.
+3. **Choose exactly one recovery class from evidence.**
+   - Journal explicitly reports invalid JSON, invalid/unknown config key, or config/schema loading failure: continue to step 4.
+   - Config parses, but journal reports missing/corrupt package files, imports, syntax, or failure to execute OpenClaw: continue to step 5.
+   - SSH/current Tailnet route fails or the Pi does not respond: continue to step 7.
+   - Anything else, mixed evidence, filesystem/I/O errors, permissions, repeated OOM, or uncertainty: **stop and escalate**. Preserve step 2 output; do not guess.
 
-Current ports verified 2026-09-22: Gateway `18789` on Pi loopback; browser relay `18792` on Pi loopback. They are not public listeners. For the laptop browser extension, keep this separate tunnel open: `ssh -L 18792:127.0.0.1:18792 john@clawdbot-pi`.
+4. **Config-only recovery.** First validate both files:
 
-## Path A — Config failure
+   ```bash
+   ls -l ~/.openclaw/openclaw.json ~/.openclaw/watchdog/known-good.json
+   jq empty ~/.openclaw/openclaw.json
+   jq empty ~/.openclaw/watchdog/known-good.json
+   ```
 
-Use this path only when the journal explicitly reports invalid JSON, an unknown/invalid config key, or a config/schema load failure. First verify the recovery file exists:
+   If either known-good check fails, **stop and escalate**. Otherwise preserve the failed config, restore the known-good config, and restart once:
 
-```bash
-ls -l ~/.openclaw/openclaw.json ~/.openclaw/watchdog/known-good.json
-jq empty ~/.openclaw/watchdog/known-good.json
-```
+   ```bash
+   stamp=$(date -u +%Y%m%dT%H%M%SZ)
+   cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.failed-$stamp
+   cp ~/.openclaw/watchdog/known-good.json ~/.openclaw/openclaw.json
+   systemctl --user restart openclaw-gateway.service
+   ```
 
-Expected: both files exist and `jq empty` exits silently with status 0. Then preserve the failed config, restore the watchdog's last-known-good copy, and restart only the Gateway:
+   Wait 15 seconds and continue to step 6. Do not hand-edit JSON during an outage.
 
-```bash
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.failed-$stamp
-cp ~/.openclaw/watchdog/known-good.json ~/.openclaw/openclaw.json
-systemctl --user restart openclaw-gateway.service
-```
+5. **Runtime/package recovery.** Use only the reviewed transactional script:
 
-Wait 15 seconds, then run the final verification block below. Do not hand-edit JSON during an outage. If `known-good.json` is absent/invalid, stop.
+   ```bash
+   cd ~/.openclaw/workspace/projects/openclaw-fork
+   scripts/clawdbot/rollback-runtime.sh \
+     --archive ~/.openclaw/releases/current-good.tgz \
+     --yes
+   ```
 
-## Path B — Runtime/package failure
+   The script fails closed on missing/malformed/ambiguous/mismatched checksums, shares a lock with backup/install, preserves the exact prior runtime and running/stopped state, and only reports success after active-path and required structured-health verification. If it reports any failure, **stop and escalate**. Do not extract, rename, symlink, or replace the package manually. Do not use `install-candidate.sh` as disaster recovery.
 
-Use this path only when config parses successfully but the service journal shows missing package files, module/import errors, syntax errors, or failure to execute OpenClaw.
+6. **Run final verification and stop on any failure.**
 
-Verify the known-good archive and checksum before changing anything:
+   ```bash
+   cd ~/.openclaw/workspace/projects/openclaw-fork
+   systemctl --user is-active openclaw-gateway.service
+   scripts/clawdbot/smoke-test.sh --binary "$(command -v openclaw)" --gateway
+   ss -ltn | grep -E '127\.0\.0\.1:18789|\[::1\]:18789'
+   python3 ~/.openclaw/workspace/scripts/gateway_watchdog.py --status
+   ```
 
-```bash
-cd ~/.openclaw/workspace/projects/openclaw-fork
-ls -l ~/.openclaw/releases/current-good.tgz ~/.openclaw/releases/current-good.tgz.sha256
-expected=$(awk 'NF {print $1; exit}' ~/.openclaw/releases/current-good.tgz.sha256)
-actual=$(sha256sum ~/.openclaw/releases/current-good.tgz | awk '{print $1}')
-printf 'expected=%s\nactual=%s\n' "$expected" "$actual"
-test "$expected" = "$actual" && echo 'checksum: PASS'
-```
+   Required results are `active`, a parsed structured RPC health response with `ok: true`, a loopback listener, and no pending watchdog recovery. Then send one harmless bot message. Do not run an update because recovery succeeded.
 
-Expected: `checksum: PASS`. Then invoke the reviewed **manual disaster-recovery** script:
+   **Known external blocker:** the live watchdog source is outside this repository at `~/.openclaw/workspace/scripts/gateway_watchdog.py`. As reviewed on 2026-09-22, lines 136–144 still use the unsupported plain HTTP health route and even treat an active process as healthy when that request fails. This PR intentionally does not edit or apply that live external file. Therefore watchdog status is supplemental only and cannot satisfy the structured-health gate; correcting and separately deploying the watchdog remains an owner-reviewed blocker.
 
-```bash
-scripts/clawdbot/rollback-runtime.sh \
-  --archive ~/.openclaw/releases/current-good.tgz \
-  --yes
-```
+7. **Whole-Pi/current-Tailnet failure.** On the laptop:
 
-The script preserves the failed runtime, restores the archive, starts the user Gateway, and performs its checks. Expected final line: `Rollback succeeded.`
+   ```bash
+   tailscale status
+   tailscale ping clawdbot-pi-1.tail400409.ts.net
+   ssh john@clawdbot-pi-1.tail400409.ts.net
+   # Current numeric fallback only:
+   ssh john@100.126.230.66
+   ```
 
-This manual recovery is different from `install-candidate.sh` automatic rollback. The installer handles an unhealthy candidate during a separately approved install; do **not** use it in an outage.
-
-## Path C — Whole-Pi or network failure
-
-### C1. Check Tailscale from the laptop
-
-```bash
-tailscale status
-tailscale ping clawdbot-pi
-```
-
-Expected: Tailscale is connected and the ping resolves `clawdbot-pi`. Then retry:
-
-```bash
-ssh john@clawdbot-pi
-```
-
-If Tailscale is connected but the name does not resolve, retry the currently verified address:
-
-```bash
-ssh john@100.126.230.66
-```
-
-### C2. If SSH still fails
-
-1. Confirm the Pi has power and its Ethernet/Wi-Fi network is available.
-2. If possible, attach a monitor/keyboard and log in locally. Confirm the machine identity:
+   If current Tailnet access still fails, confirm power and Ethernet/Wi-Fi. With physical monitor/keyboard access, inspect only:
 
    ```bash
    hostname
@@ -122,50 +102,16 @@ ssh john@100.126.230.66
    systemctl --user status openclaw-gateway.service --no-pager
    ```
 
-3. If the OS works locally and only Tailscale is inactive, John may restart Tailscale once:
+   If the OS is healthy and only Tailscale is inactive, John may restart Tailscale once. If the OS is responsive but generally wedged, John may perform one clean reboot, wait 2–3 minutes, and return to step 1. Do not repeatedly power-cycle, reimage, reinstall OpenClaw, change Tailnet nodes, or improvise around filesystem/read-only/I/O errors.
 
-   ```bash
-   sudo systemctl restart tailscaled
-   tailscale status
-   ```
+## Absolute stop/escalation conditions
 
-4. If the OS works but remains generally wedged, perform one clean reboot:
+Stop immediately and preserve logs if:
 
-   ```bash
-   sudo reboot
-   ```
+- the current FQDN/address reaches an unexpected host or host key;
+- config LKG, runtime archive, or exact checksum validation fails;
+- transactional rollback or final structured health fails;
+- recovery would require credentials, safeguard changes, systemd installation changes, Tailnet mutation, or manual package replacement;
+- the evidence does not select exactly one route above.
 
-   Wait 2–3 minutes, reconnect with SSH, and return to the emergency checklist.
-
-Do not repeatedly power-cycle the Pi. If it does not boot, reports filesystem/I/O errors, mounts storage read-only, or the host is not clearly `clawdbot-pi`, stop and diagnose the hardware/storage/network with physical access. Do not reimage the SD card or reinstall OpenClaw as an emergency guess.
-
-## Final verification
-
-Run after any recovery:
-
-```bash
-systemctl --user is-active openclaw-gateway.service
-curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18789/healthz
-ss -ltn | grep -E '127\.0\.0\.1:18789|\[::1\]:18789'
-python3 ~/.openclaw/workspace/scripts/gateway_watchdog.py --status
-```
-
-Expected:
-
-- `active`
-- health JSON with `"ok":true`
-- at least one loopback listener on port `18789`
-- watchdog status reports healthy/no pending recovery
-
-Then send the bot a harmless message. Do not run upgrades just because recovery succeeded.
-
-## Stop—do not improvise—if any of these are true
-
-- A command resolves to a host other than `clawdbot-pi`.
-- The known-good config or runtime archive is missing, invalid, or fails checksum.
-- The rollback script reports failure or the final health check still fails.
-- Logs show filesystem, SD-card, permission, or repeated out-of-memory failures.
-- Recovery would require editing credentials, disabling safeguards, changing systemd installation, or replacing the live package manually.
-- You are unsure whether a path is config-only or runtime-only.
-
-Preserve the output of `systemctl status` and `journalctl`; get a second review before any further mutation.
+Get a second review before any further mutation.

@@ -1,8 +1,9 @@
 name: Clawdbot fork package build
 
 on:
-  workflow_dispatch:
   pull_request:
+    branches: [clawdbot-stable]
+  push:
     branches: [clawdbot-stable]
     paths:
       - "package.json"
@@ -36,6 +37,13 @@ jobs:
           node-version: "22"
           package-manager-cache: false
 
+      - name: Run isolated installer and rollback safety tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n scripts/clawdbot/*.sh scripts/clawdbot/tests/*.sh
+          scripts/clawdbot/tests/install-candidate.test.sh
+
       - name: Enable pinned pnpm
         run: |
           corepack enable
@@ -63,9 +71,11 @@ jobs:
             echo "repository=${GITHUB_REPOSITORY}"
             echo "ref=${GITHUB_REF}"
             echo "sha=${GITHUB_SHA}"
+            echo "event_name=${GITHUB_EVENT_NAME}"
             echo "node=$(node --version)"
             echo "pnpm=$(pnpm --version)"
             echo "tarball=$(basename "$tarball")"
+            echo "package_sha256=$(sha256sum "$tarball" | awk '{print $1}')"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > artifacts/build-metadata.txt
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"

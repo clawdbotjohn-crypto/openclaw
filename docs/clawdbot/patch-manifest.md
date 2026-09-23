@@ -81,20 +81,27 @@ without the downstream shim.
 
 ### Staged candidate installer and portable build checksum
 
-**Downstream implementation:** `scripts/clawdbot/install-candidate.sh` verifies a downloaded npm
-tarball checksum, validates package shape, creates a complete pre-install backup, installs into a
-separate prefix, validates that CLI, then performs a service/health-gated swap. Failed candidates
-are preserved and the immediately previous runtime is automatically restored and health-checked.
-It is validation-only by default; mutation requires `--apply --yes`, and the active global target
-also requires `--allow-live-runtime`. The package-build workflow records a portable checksum line
-using the tarball basename rather than a runner-absolute path.
+**Downstream implementation:** `scripts/clawdbot/install-candidate.sh` fails closed on an exact,
+single-record tarball checksum and exact `build-metadata.txt` repository/promotable branch ref/
+post-merge SHA/push event/tarball checksum. Pull refs and PR artifacts are not promotable. It
+validates package shape and isolated CLI execution, then uses the same runtime lock as backup and
+manual rollback. A running baseline must pass parsed `openclaw health --json` WebSocket RPC before
+a validated complete archive transactionally replaces known-good pointers. The candidate swap has
+phase-aware ERR/INT/TERM/EXIT recovery that restores the exact prior runtime/path and prior
+running/stopped service state. It is validation-only by default; mutation requires `--apply --yes`,
+and the active global target also requires `--allow-live-runtime`. Promotion remains post-merge.
 
-**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` covers no-mutation dry run,
-confirmation refusal, successful staged installation, and unhealthy-candidate automatic rollback
-against fake prefixes/services/health checks only.
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 85 isolated fake-environment
+cases: every installer/rollback mutation boundary crossed with ERR/INT/TERM/EXIT (including the
+post-move/pre-bookkeeping signal windows), structured-health failure, exact runtime and
+running/stopped state restoration, shared lock contention, known-good preservation and pointer
+transaction failure, and checksum/provenance rejection. Fake `systemctl`, npm, CLI, and `/tmp`
+directories prevent any test from reaching live state.
 
 **Rollback:** revert the installer/workflow commit. This does not alter package runtime behavior,
-config schema, or user state. The independent manual `rollback-runtime.sh` recovery path remains.
+config schema, or user state. For an operational outage, use only the independent transactional
+`rollback-runtime.sh` owner route in `EMERGENCY-RECOVERY.md`; never perform manual package
+replacement.
 
 ## Historical patches requiring re-verification
 
