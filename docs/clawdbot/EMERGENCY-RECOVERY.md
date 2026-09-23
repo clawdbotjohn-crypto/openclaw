@@ -50,13 +50,25 @@
    If either known-good check fails, **stop and escalate**. Otherwise preserve the failed config, restore the known-good config, and restart once:
 
    ```bash
+   set -euo pipefail
+   config="$HOME/.openclaw/openclaw.json"
+   known_good="$HOME/.openclaw/watchdog/known-good.json"
    stamp=$(date -u +%Y%m%dT%H%M%SZ)
-   cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.failed-$stamp
-   cp ~/.openclaw/watchdog/known-good.json ~/.openclaw/openclaw.json
+   failed="$config.failed-$stamp"
+   temp=$(mktemp "$HOME/.openclaw/.openclaw.json.restore.XXXXXX")
+   trap 'rm -f -- "$temp"' EXIT
+   cp --preserve=mode,ownership -- "$config" "$failed"
+   cp --preserve=mode,ownership -- "$known_good" "$temp"
+   jq empty "$temp"
+   chown --reference="$config" "$temp"
+   chmod --reference="$config" "$temp"
+   mv -T -- "$temp" "$config"
+   trap - EXIT
+   jq empty "$config" || { echo "Atomic config verification failed; stop and escalate." >&2; exit 1; }
    systemctl --user restart openclaw-gateway.service
    ```
 
-   Wait 15 seconds and continue to step 6. Do not hand-edit JSON during an outage.
+   Wait 15 seconds and continue to step 6. If any copy, metadata preservation, JSON validation, atomic rename, or restart command fails, **stop and escalate without another restart**. Do not hand-edit JSON during an outage.
 
 5. **Runtime/package recovery.** Use only the reviewed transactional script:
 

@@ -158,10 +158,11 @@ previous_runtime="$tx_dir/previous-runtime"
 failed_runtime="$tx_dir/failed-runtime"
 bin_link="$PREFIX/bin/openclaw"
 original_bin_target="$(readlink "$bin_link")"
+original_runtime_identity="$(runtime_path_identity "$RUNTIME_DIR")"
 
-if ! "$NPM_BIN" install --global --prefix "$stage_prefix" "$ARTIFACT"; then echo "Candidate staging failed; private transaction retained at: $tx_dir" >&2; exit 1; fi
+if ! runtime_run_without_lock "$NPM_BIN" install --ignore-scripts --global --prefix "$stage_prefix" "$ARTIFACT"; then echo "Candidate staging failed; private transaction retained at: $tx_dir" >&2; exit 1; fi
 [[ -f "$staged_runtime/package.json" && -f "$staged_runtime/openclaw.mjs" ]] || { echo "Staged candidate is invalid; retained at: $tx_dir" >&2; exit 1; }
-OPENCLAW_STATE_DIR="$stage_prefix/state" OPENCLAW_CONFIG_PATH="$stage_prefix/openclaw.json" "$stage_prefix/bin/openclaw" --version >/dev/null
+OPENCLAW_STATE_DIR="$stage_prefix/state" OPENCLAW_CONFIG_PATH="$stage_prefix/openclaw.json" runtime_run_without_lock "$stage_prefix/bin/openclaw" --version >/dev/null
 
 transaction_active=false; recovering=false; script_pid="$BASHPID"
 restore_previous() {
@@ -173,9 +174,16 @@ restore_previous() {
   runtime_test_repeated_recovery_signals || true
   echo "Recovery required after $reason; restoring exact pre-install runtime/service state." >&2
   if [[ -d "$previous_runtime" ]]; then
-    runtime_capture_service_state || ok=false
-    if $ok && [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
-      "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || ok=false
+    if [[ "$(runtime_path_identity "$previous_runtime" 2>/dev/null || true)" != "$original_runtime_identity" ]]; then
+      echo "CRITICAL: previous-runtime is not the exact original; refusing recovery mutation." >&2
+      return 1
+    fi
+    if ! runtime_capture_service_state; then
+      echo "CRITICAL: recovery service-state query failed before any further mutation; transaction retained at: $tx_dir" >&2
+      return 1
+    fi
+    if [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
+      runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || ok=false
       $ok && runtime_require_service_state inactive || ok=false
     fi
     if $ok && [[ -e "$RUNTIME_DIR" || -L "$RUNTIME_DIR" ]]; then
@@ -212,12 +220,17 @@ trap 'abort_transaction INT 130' INT
 trap 'abort_transaction TERM 143' TERM
 trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; else cleanup_artifact_snapshot; fi' EXIT
 
+[[ ! -e "$previous_runtime" && ! -L "$previous_runtime" && ! -e "$failed_runtime" && ! -L "$failed_runtime" ]] || {
+  echo "Transaction sibling collision detected before mutation; retained at: $tx_dir" >&2; exit 1;
+}
 transaction_active=true
 runtime_test_hook before-stop
-"$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE"
+runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE"
 runtime_require_service_state inactive
 runtime_test_hook after-stop
+[[ ! -e "$previous_runtime" && ! -L "$previous_runtime" ]] || { echo "previous-runtime collision; refusing original move." >&2; false; }
 mv -T -- "$RUNTIME_DIR" "$previous_runtime"
+[[ "$(runtime_path_identity "$previous_runtime")" == "$original_runtime_identity" ]] || { echo "Original runtime identity changed during move." >&2; false; }
 runtime_test_hook after-move-original
 mv -T -- "$staged_runtime" "$RUNTIME_DIR"
 runtime_test_hook after-activate-candidate
@@ -228,7 +241,7 @@ runtime_test_hook after-link
 runtime_verify_active_path "$RUNTIME_DIR" "$bin_link"
 RUNTIME_HEALTH_BIN="$bin_link"
 if [[ "$initial_service_state" == active ]]; then
-  "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE"
+  runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE"
   runtime_require_service_state active
   runtime_test_hook after-start
   runtime_wait_for_structured_health

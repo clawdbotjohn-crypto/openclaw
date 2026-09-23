@@ -98,34 +98,43 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 tx_dir="$(runtime_make_private_tx_dir "$OUTPUT_DIR" openclaw-backup-tx)"
 script_pid="$BASHPID"
 archive=""; checksum=""; manifest=""
-trap 'rc=$?; if [[ "$BASHPID" == "$script_pid" && "$rc" != 0 ]]; then rm -rf -- "$tx_dir"; [[ -z "$archive" ]] || rm -f -- "$archive" "$checksum" "$manifest"; fi' EXIT
+cleanup_backup_tx() { chmod -R u+w -- "$tx_dir" 2>/dev/null || true; rm -rf -- "$tx_dir"; }
+trap 'rc=$?; if [[ "$BASHPID" == "$script_pid" && "$rc" != 0 ]]; then cleanup_backup_tx; [[ -z "$archive" ]] || rm -f -- "$archive" "$checksum" "$manifest"; fi' EXIT
 snapshot_parent="$tx_dir/snapshot"
 snapshot_runtime="$snapshot_parent/openclaw"
 mkdir -m 700 "$snapshot_parent"
+runtime_validate_internal_symlinks "$RUNTIME_DIR"
 source_digest_before="$(runtime_tree_digest "$RUNTIME_DIR")"
+source_identity="$(runtime_identity_digest "$RUNTIME_DIR")"
 cp -a -- "$RUNTIME_DIR" "$snapshot_runtime"
 runtime_test_hook after-runtime-snapshot
 source_digest_after="$(runtime_tree_digest "$RUNTIME_DIR")"
-snapshot_digest_before="$(runtime_tree_digest "$snapshot_runtime")"
-[[ "$source_digest_before" == "$source_digest_after" && "$source_digest_before" == "$snapshot_digest_before" ]] || {
+snapshot_copy_digest="$(runtime_tree_digest "$snapshot_runtime")"
+[[ "$source_digest_before" == "$source_digest_after" && "$source_digest_before" == "$snapshot_copy_digest" ]] || {
   echo "Runtime changed while its private snapshot was captured; refusing backup." >&2
-  rm -rf -- "$tx_dir"
+  cleanup_backup_tx
   exit 1
 }
 
-# The executable actually probed is inside the immutable tree that will be archived.
+runtime_validate_internal_symlinks "$snapshot_runtime"
+# Remove write permission before probing/archiving. The finalized archive is
+# independently extracted and must reproduce this exact canonical tree digest.
+chmod -R a-w -- "$snapshot_runtime"
+snapshot_digest_before="$(runtime_tree_digest "$snapshot_runtime")"
 RUNTIME_HEALTH_BIN="$snapshot_runtime/openclaw.mjs"
+[[ "$(runtime_identity_digest "$snapshot_runtime")" == "$source_identity" ]] || { echo "Snapshot implementation identity changed." >&2; false; }
+RUNTIME_EXPECTED_SERVER_TREE_SHA256="$source_identity"
 if $PROMOTE; then
   runtime_structured_health_once || {
     echo "Snapshot is not proven healthy by its bound structured CLI/RPC probe; preserving current-good pointers." >&2
-    rm -rf -- "$tx_dir"
+    cleanup_backup_tx
     exit 1
   }
 fi
 snapshot_digest_after_health="$(runtime_tree_digest "$snapshot_runtime")"
 [[ "$snapshot_digest_before" == "$snapshot_digest_after_health" ]] || {
   echo "Runtime snapshot mutated during health validation; refusing backup." >&2
-  rm -rf -- "$tx_dir"
+  cleanup_backup_tx
   exit 1
 }
 
@@ -197,7 +206,7 @@ finish_or_recover_pointer_tx() {
     echo "CRITICAL: known-good pointer recovery/verification failed. Recovery journal and copies retained at: $tx_dir" >&2
     exit 3
   fi
-  rm -rf -- "$tx_dir"
+  cleanup_backup_tx
   case "$source" in INT) exit 130 ;; TERM) exit 143 ;; EXIT) exit "$rc" ;; *) exit "$rc" ;; esac
 }
 echo "Archiving private snapshot of $RUNTIME_DIR ($runtime_bytes bytes)..."
@@ -205,6 +214,15 @@ tar -C "$snapshot_parent" -czf "$partial" openclaw
 snapshot_digest_after_tar="$(runtime_tree_digest "$snapshot_runtime")"
 [[ "$snapshot_digest_before" == "$snapshot_digest_after_tar" ]] || { echo "Runtime snapshot mutated while archived." >&2; false; }
 mv -Tf -- "$partial" "$archive"
+verify_parent="$tx_dir/archive-verify"
+verify_runtime="$verify_parent/openclaw"
+mkdir -m 700 "$verify_parent"
+tar -xzf "$archive" -C "$verify_parent"
+runtime_validate_internal_symlinks "$verify_runtime"
+[[ "$(runtime_tree_digest "$verify_runtime")" == "$snapshot_digest_before" ]] || {
+  echo "Finalized archive does not reproduce the probed snapshot." >&2
+  false
+}
 ( umask 077; cd "$OUTPUT_DIR" && sha256sum "$(basename "$archive")" > "$(basename "$checksum")" )
 runtime_validate_checksum "$archive" "$checksum"
 runtime_archive_list "$archive" "$list_file"
@@ -263,6 +281,6 @@ else
 fi
 
 trap - ERR INT TERM EXIT
-rm -rf -- "$tx_dir"
+cleanup_backup_tx
 echo "Backup complete: $archive"
 echo "Checksum: $RUNTIME_VALIDATED_SHA256"

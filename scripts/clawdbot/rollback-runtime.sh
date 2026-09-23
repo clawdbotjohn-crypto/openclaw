@@ -110,6 +110,7 @@ mkdir -m 700 "$stage"
 tar -xzf "$ARCHIVE" --strip-components=1 -C "$stage"
 [[ -f "$stage/package.json" && -f "$stage/openclaw.mjs" ]] || { echo "Archive does not contain a valid OpenClaw runtime; transaction retained at: $tx_dir" >&2; exit 1; }
 original_bin_target="$(readlink "$bin_link")"
+original_runtime_identity="$(runtime_path_identity "$RUNTIME_DIR")"
 
 transaction_active=false; recovering=false; script_pid="$BASHPID"
 restore_original() {
@@ -121,9 +122,16 @@ restore_original() {
   runtime_test_repeated_recovery_signals || true
   echo "Recovery required after $reason; restoring exact pre-rollback runtime/service state." >&2
   if [[ -d "$replaced" ]]; then
-    runtime_capture_service_state || ok=false
-    if $ok && [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
-      "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || ok=false
+    if [[ "$(runtime_path_identity "$replaced" 2>/dev/null || true)" != "$original_runtime_identity" ]]; then
+      echo "CRITICAL: replaced-runtime is not the exact original; refusing recovery mutation." >&2
+      return 1
+    fi
+    if ! runtime_capture_service_state; then
+      echo "CRITICAL: recovery service-state query failed before any further mutation; transaction retained at: $tx_dir" >&2
+      return 1
+    fi
+    if [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
+      runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || ok=false
       $ok && runtime_require_service_state inactive || ok=false
     fi
     if $ok && [[ -e "$RUNTIME_DIR" || -L "$RUNTIME_DIR" ]]; then
@@ -159,12 +167,17 @@ trap 'abort_transaction INT 130' INT
 trap 'abort_transaction TERM 143' TERM
 trap 'rc=$?; if $transaction_active; then abort_transaction EXIT "$rc"; else cleanup_archive_snapshot; fi' EXIT
 
+[[ ! -e "$replaced" && ! -L "$replaced" && ! -e "$restore_failed" && ! -L "$restore_failed" ]] || {
+  echo "Transaction sibling collision detected before mutation; retained at: $tx_dir" >&2; exit 1;
+}
 transaction_active=true
 runtime_test_hook before-stop
-"$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE"
+runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE"
 runtime_require_service_state inactive
 runtime_test_hook after-stop
+[[ ! -e "$replaced" && ! -L "$replaced" ]] || { echo "replaced-runtime collision; refusing original move." >&2; false; }
 mv -T -- "$RUNTIME_DIR" "$replaced"
+[[ "$(runtime_path_identity "$replaced")" == "$original_runtime_identity" ]] || { echo "Original runtime identity changed during move." >&2; false; }
 runtime_test_hook after-move-original
 mv -T -- "$stage" "$RUNTIME_DIR"
 runtime_test_hook after-activate-restored
@@ -175,7 +188,7 @@ runtime_test_hook after-link
 runtime_verify_active_path "$RUNTIME_DIR" "$bin_link"
 RUNTIME_HEALTH_BIN="$bin_link"
 if [[ "$initial_service_state" == active ]]; then
-  "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE"
+  runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE"
   runtime_require_service_state active
   runtime_test_hook after-start
   runtime_wait_for_structured_health

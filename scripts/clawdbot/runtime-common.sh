@@ -130,10 +130,11 @@ runtime_archive_list() {
 }
 
 runtime_validate_health_json() {
-  local file="$1" node_bin="${OPENCLAW_NODE_BIN:-node}"
-  "$node_bin" - "$file" <<'NODE'
+  local file="$1" expected_identity="${2:-}" node_bin="${OPENCLAW_NODE_BIN:-node}"
+  "$node_bin" - "$file" "$expected_identity" <<'NODE'
 const fs = require("node:fs");
 const file = process.argv[2];
+const expectedIdentity = process.argv[3] || "";
 let value;
 try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch { process.exit(2); }
 const object = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -144,7 +145,10 @@ const valid = object(value) && value.ok === true &&
   object(value.channelLabels) && typeof value.defaultAgentId === "string" && value.defaultAgentId.length > 0 &&
   Array.isArray(value.agents) && value.agents.length > 0 &&
   object(value.sessions) && typeof value.sessions.path === "string" &&
-  Number.isInteger(value.sessions.count) && value.sessions.count >= 0 && Array.isArray(value.sessions.recent);
+  Number.isInteger(value.sessions.count) && value.sessions.count >= 0 && Array.isArray(value.sessions.recent) &&
+  (!expectedIdentity || (object(value.runtimeIdentity) &&
+    value.runtimeIdentity.scheme === "openclaw-tree-sha256-v1" &&
+    value.runtimeIdentity.treeSha256 === expectedIdentity));
 process.exit(valid ? 0 : 3);
 NODE
 }
@@ -154,11 +158,13 @@ NODE
 # activating, deactivating, unknown, malformed output, and all query errors are
 # unknown and must abort before mutation.
 runtime_capture_service_state() {
-  local load output load_rc rc
+  local load output load_rc rc query_timeout="${OPENCLAW_SERVICE_QUERY_TIMEOUT_SECONDS:-10}"
+  [[ "$query_timeout" =~ ^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)$ ]] || runtime_die "Invalid service query timeout." || return
+  command -v timeout >/dev/null || runtime_die "GNU timeout is required for bounded service queries." || return
   set +e
-  load="$("$RUNTIME_SYSTEMCTL_BIN" --user show --property=LoadState --value "$RUNTIME_SERVICE" 2>/dev/null)"
+  load="$(runtime_run_without_lock timeout --foreground --signal=TERM --kill-after=1 "$query_timeout" "$RUNTIME_SYSTEMCTL_BIN" --user show --property=LoadState --value "$RUNTIME_SERVICE" 2>/dev/null)"
   load_rc=$?
-  output="$("$RUNTIME_SYSTEMCTL_BIN" --user is-active "$RUNTIME_SERVICE" 2>/dev/null)"
+  output="$(runtime_run_without_lock timeout --foreground --signal=TERM --kill-after=1 "$query_timeout" "$RUNTIME_SYSTEMCTL_BIN" --user is-active "$RUNTIME_SERVICE" 2>/dev/null)"
   rc=$?
   set -e
   load="${load%$'\n'}"
@@ -192,11 +198,11 @@ runtime_structured_health_once() {
   local health_dir output
   health_dir="$(runtime_make_private_temp_dir "$(readlink -m "${TMPDIR:-/tmp}")" openclaw-health)" || return 1
   output="$health_dir/response.json"
-  if ! ( umask 077; "$RUNTIME_HEALTH_BIN" health --json --timeout "$RUNTIME_HEALTH_TIMEOUT_MS" >"$output" 2>/dev/null ); then
+  if ! ( umask 077; runtime_run_without_lock "$RUNTIME_HEALTH_BIN" health --json --timeout "$RUNTIME_HEALTH_TIMEOUT_MS" >"$output" 2>/dev/null ); then
     rm -rf -- "$health_dir"
     return 1
   fi
-  if ! runtime_validate_health_json "$output"; then
+  if ! runtime_validate_health_json "$output" "${RUNTIME_EXPECTED_SERVER_TREE_SHA256:-}"; then
     rm -rf -- "$health_dir"
     return 1
   fi
@@ -235,18 +241,49 @@ runtime_tree_digest() {
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -C "$directory" -cf - . | sha256sum | awk '{print $1}'
 }
 
+runtime_identity_digest() {
+  local directory="$1"
+  # Canonical implementation identity: paths, types, link targets, executable
+  # bits, and bytes; writable permission differences are intentionally erased.
+  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+    --mode='u+rwX,go+rX,go-w' -C "$directory" -cf - . | sha256sum | awk '{print $1}'
+}
+
+runtime_validate_internal_symlinks() {
+  local directory="$1" link target canonical_directory
+  canonical_directory="$(readlink -f -- "$directory")" || return 1
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f -- "$link")" || runtime_die "Runtime contains a broken symlink: $link" || return
+    [[ "$target" == "$canonical_directory" || "$target" == "$canonical_directory"/* ]] ||
+      runtime_die "Runtime symlink escapes snapshot root: $link -> $target" || return
+  done < <(find "$canonical_directory" -type l -print0)
+}
+
+runtime_path_identity() {
+  local path="$1"
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  printf '%s:%s\n' "$(stat -c '%d:%i' -- "$path")" "$(runtime_tree_digest "$path")"
+}
+
+runtime_run_without_lock() {
+  (
+    if [[ -n "${RUNTIME_LOCK_FD:-}" ]]; then exec {RUNTIME_LOCK_FD}>&-; fi
+    exec "$@"
+  )
+}
+
 runtime_restore_service_state() {
   local desired="$1"
   runtime_capture_service_state || return 1
   if [[ "$desired" == active ]]; then
     if [[ "$RUNTIME_SERVICE_STATE" == inactive ]]; then
-      "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE" || return 1
+      runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE" || return 1
       runtime_require_service_state active || return 1
     fi
     runtime_wait_for_structured_health
   else
     if [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
-      "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || return 1
+      runtime_run_without_lock "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || return 1
       runtime_require_service_state inactive || return 1
     fi
     [[ "$RUNTIME_SERVICE_STATE" == inactive ]]
@@ -259,7 +296,8 @@ runtime_acquire_lock() {
   lock_file="$(readlink -m "$lock_file")"
   if [[ -n "$requested_fd" ]]; then
     [[ "$requested_fd" =~ ^[0-9]+$ && -e "/proc/$$/fd/$requested_fd" ]] || runtime_die "Invalid inherited lock descriptor." || return
-    [[ "$(readlink -f "/proc/$$/fd/$requested_fd")" == "$lock_file" ]] || runtime_die "Inherited lock does not match $lock_file." || return
+    [[ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/$requested_fd")" == "$(stat -Lc '%d:%i' -- "$lock_file")" ]] ||
+      runtime_die "Inherited lock device/inode does not match $lock_file." || return
     flock -n "$requested_fd" || runtime_die "Shared runtime lock is not held." || return
     RUNTIME_LOCK_FD="$requested_fd"
     return 0
@@ -278,6 +316,15 @@ runtime_test_hook() {
   [[ "$test_root" == /tmp/* && "$runtime_path" == "$test_root"/* ]] || runtime_die "Refusing test hook outside an isolated /tmp root." || return
   echo "TEST HOOK: $mode at $phase" >&2
   case "$mode" in
+    COLLIDE)
+      [[ "${OPENCLAW_TEST_COLLISION_NAME:-}" =~ ^(previous-runtime|replaced-runtime|failed-runtime|failed-restored-runtime)$ ]] ||
+        runtime_die "Invalid test collision name." || return
+      local tx
+      tx="$(find "$(dirname "$runtime_path")" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-*-tx.*' -print -quit)"
+      [[ -n "$tx" ]] || runtime_die "Test transaction not found." || return
+      mkdir -p "$tx/$OPENCLAW_TEST_COLLISION_NAME"
+      echo collision-sentinel > "$tx/$OPENCLAW_TEST_COLLISION_NAME/sentinel"
+      ;;
     ERR) return 97 ;;
     INT) kill -INT "$$"; return 97 ;;
     TERM) kill -TERM "$$"; return 97 ;;
