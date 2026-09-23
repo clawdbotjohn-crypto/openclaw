@@ -54,8 +54,7 @@ SOURCE_ARCHIVE="$(readlink -f "$ARCHIVE")"
 SOURCE_CHECKSUM="${CHECKSUM:-${SOURCE_ARCHIVE}.sha256}"
 [[ -f "$SOURCE_CHECKSUM" ]] || { echo "Checksum file is required: $SOURCE_CHECKSUM" >&2; exit 1; }
 SOURCE_CHECKSUM="$(readlink -f "$SOURCE_CHECKSUM")"
-archive_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-rollback-archive.XXXXXX")"
-chmod 700 "$archive_snapshot_dir"
+archive_snapshot_dir="$(runtime_make_private_temp_dir "$(readlink -m "${TMPDIR:-/tmp}")" openclaw-rollback-archive)"
 cleanup_archive_snapshot() { [[ -z "${archive_snapshot_dir:-}" ]] || rm -rf -- "$archive_snapshot_dir"; archive_snapshot_dir=""; }
 trap cleanup_archive_snapshot EXIT
 mkdir -m 700 "$archive_snapshot_dir/archive" "$archive_snapshot_dir/inputs"

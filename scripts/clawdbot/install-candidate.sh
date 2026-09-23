@@ -77,8 +77,7 @@ SOURCE_CHECKSUM="${CHECKSUM:-${SOURCE_ARTIFACT}.sha256}"
 [[ -f "$SOURCE_CHECKSUM" ]] || { echo "Checksum file is required: $SOURCE_CHECKSUM" >&2; exit 1; }
 SOURCE_CHECKSUM="$(readlink -f "$SOURCE_CHECKSUM")"
 SOURCE_METADATA="$(readlink -f "$METADATA")"
-artifact_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-install-artifact.XXXXXX")"
-chmod 700 "$artifact_snapshot_dir"
+artifact_snapshot_dir="$(runtime_make_private_temp_dir "$(readlink -m "${TMPDIR:-/tmp}")" openclaw-install-artifact)"
 cleanup_artifact_snapshot() { [[ -z "${artifact_snapshot_dir:-}" ]] || rm -rf -- "$artifact_snapshot_dir"; artifact_snapshot_dir=""; }
 trap cleanup_artifact_snapshot EXIT
 mkdir -m 700 "$artifact_snapshot_dir/artifact" "$artifact_snapshot_dir/inputs"

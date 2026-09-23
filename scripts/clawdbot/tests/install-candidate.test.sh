@@ -583,6 +583,24 @@ test_recovery_stop_failure_retains() {
   assert_lock_released
 }
 
+test_unsafe_temp_parent_rejected() {
+  local tool="$1"
+  setup_case active
+  chmod 777 "$case_root/tmp"
+  local rc=0
+  case "$tool" in
+    install) install_cmd >/dev/null 2>&1 || rc=$? ;;
+    rollback) rollback_cmd >/dev/null 2>&1 || rc=$? ;;
+    backup) backup_cmd >/dev/null 2>&1 || rc=$? ;;
+  esac
+  assert test "$rc" -ne 0 || return
+  assert_runtime_identity || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert test ! -e "$RELEASES/current-good.tgz" || return
+  assert test -z "$(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-backup-tx.*' -print -quit)" || return
+  assert_lock_released
+}
+
 test_corrupt_partial_archive_list() {
   local tool="$1"
   setup_case active
@@ -735,6 +753,7 @@ for tool in install rollback; do
 done
 for tool in install rollback backup; do
   run_case "$tool rejects plausible partial archive list with producer failure" test_corrupt_partial_archive_list "$tool"
+  run_case "$tool rejects an other-writable temporary parent" test_unsafe_temp_parent_rejected "$tool"
 done
 pointer_names_for_test=(current-good.tgz current-good.tgz.sha256 current-good.tgz.manifest.txt)
 for mode in ERR INT TERM EXIT; do

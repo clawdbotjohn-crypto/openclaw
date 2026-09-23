@@ -24,6 +24,33 @@ runtime_validate_owned_directory() {
   (( (8#$mode & 0002) == 0 )) || runtime_die "Transaction parent is writable by other users: $directory" || return
 }
 
+runtime_validate_temp_parent() {
+  local directory="$1" canonical owner mode numeric
+  [[ -d "$directory" && ! -L "$directory" ]] || runtime_die "Temporary parent is missing or is a symlink: $directory" || return
+  canonical="$(readlink -f -- "$directory")" || runtime_die "Cannot canonicalize temporary parent: $directory" || return
+  [[ "$canonical" == "$directory" ]] || runtime_die "Temporary parent must be supplied by its canonical path: $directory" || return
+  owner="$(stat -c %u -- "$directory")"; mode="$(stat -c %a -- "$directory")"; numeric=$((8#$mode))
+  if [[ "$owner" == "$(id -u)" ]]; then
+    (( (numeric & 0002) == 0 )) || runtime_die "User-owned temporary parent is writable by other users: $directory" || return
+  else
+    # Standard root-owned /tmp-style directories are safe only with the sticky bit.
+    [[ "$owner" == 0 ]] && (( (numeric & 01000) != 0 )) || runtime_die "Temporary parent ownership/mode is unsafe: $directory" || return
+  fi
+}
+
+runtime_make_private_temp_dir() {
+  local parent="$1" prefix="$2" result
+  parent="$(readlink -m -- "$parent")"
+  runtime_validate_temp_parent "$parent" || return
+  [[ "$prefix" =~ ^[A-Za-z0-9._-]+$ ]] || runtime_die "Invalid temporary transaction prefix." || return
+  result="$(mktemp -d "$parent/${prefix}.XXXXXX")" || runtime_die "Could not create private temporary directory in $parent" || return
+  chmod 700 "$result" || { rm -rf -- "$result"; return 1; }
+  [[ ! -L "$result" && "$(stat -c %u:%a -- "$result")" == "$(id -u):700" ]] || {
+    rm -rf -- "$result"; runtime_die "Private temporary directory validation failed."; return
+  }
+  printf '%s\n' "$result"
+}
+
 runtime_make_private_tx_dir() {
   local parent="$1" prefix="$2" result
   runtime_validate_owned_directory "$parent" || return
@@ -162,17 +189,18 @@ runtime_require_service_state() {
 
 runtime_structured_health_once() {
   runtime_require_service_state active || return 1
-  local output
-  output="$(mktemp "${TMPDIR:-/tmp}/openclaw-health.XXXXXX")" || return 1
-  if ! "$RUNTIME_HEALTH_BIN" health --json --timeout "$RUNTIME_HEALTH_TIMEOUT_MS" >"$output" 2>/dev/null; then
-    rm -f "$output"
+  local health_dir output
+  health_dir="$(runtime_make_private_temp_dir "$(readlink -m "${TMPDIR:-/tmp}")" openclaw-health)" || return 1
+  output="$health_dir/response.json"
+  if ! ( umask 077; "$RUNTIME_HEALTH_BIN" health --json --timeout "$RUNTIME_HEALTH_TIMEOUT_MS" >"$output" 2>/dev/null ); then
+    rm -rf -- "$health_dir"
     return 1
   fi
   if ! runtime_validate_health_json "$output"; then
-    rm -f "$output"
+    rm -rf -- "$health_dir"
     return 1
   fi
-  rm -f "$output"
+  rm -rf -- "$health_dir"
 }
 
 runtime_wait_for_structured_health() {

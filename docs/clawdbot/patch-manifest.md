@@ -104,12 +104,12 @@ service stop/start restoration cannot be proven. The installer is validation-onl
 requires `--apply --yes`, and the active global target also requires `--allow-live-runtime`. Promotion
 remains post-merge.
 
-**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 194 isolated fake-environment
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 197 isolated fake-environment
 cases: every applicable running and stopped installer/rollback mutation boundary crossed with
 ERR/INT/TERM/EXIT; exact runtime content/inode/path, pointer bytes/link/absence, lock, and service
 state assertions; active/inactive and every fail-closed service-state class; stop/start and
 recovery-stop/recovery-start failure; same-runtime and A-vs-B health binding, aliases, symlink escape,
-and source mutation; private collision-proof transactions; producer-failing plausible archive lists;
+and source mutation; private collision-proof transactions and unsafe temporary-parent rejection; producer-failing plausible archive lists;
 and immediately-before/immediately-after every pointer rename, restore failure, repeated recovery
 signals, and post-commit reconciliation. Checksum/provenance and structured-health gates remain
 covered. Fake `systemctl`, npm, CLI, archive tools, and `/tmp` directories prevent tests from reaching
