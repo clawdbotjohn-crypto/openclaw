@@ -96,13 +96,42 @@ setup_case() {
 set -euo pipefail
 state="${FAKE_SERVICE_STATE:?}"
 action="${2:-}"
+bump_and_maybe_fail() {
+  local kind="$1" fail_at_var counter count=0 fail_at
+  fail_at_var="FAKE_SYSTEMCTL_FAIL_${kind^^}_AT"
+  counter="$state.${kind}-count"
+  [[ ! -f "$counter" ]] || count="$(cat "$counter")"
+  count=$((count + 1)); echo "$count" > "$counter"
+  fail_at="${!fail_at_var:-0}"
+  [[ "$count" != "$fail_at" ]]
+}
 case "$action" in
-  is-active) [[ "$(cat "$state")" == active ]] ;;
-  stop) [[ "${FAKE_SYSTEMCTL_FAIL_STOP:-}" != 1 ]] || exit 40; echo inactive > "$state" ;;
-  start)
-    [[ "${FAKE_SYSTEMCTL_FAIL_START:-}" != 1 ]] || exit 41
-    echo active > "$state"
+  show)
+    value="$(cat "$state")"
+    case "$value" in
+      unknown-unit) echo not-found; exit 0 ;;
+      timeout) exit 124 ;;
+      query-error|permission) exit 1 ;;
+      *) echo loaded; exit 0 ;;
+    esac
     ;;
+  is-active)
+    value="$(cat "$state")"
+    case "$value" in
+      active) echo active; exit 0 ;;
+      inactive) echo inactive; exit 3 ;;
+      stopped) echo stopped; exit 3 ;;
+      failed|activating|deactivating) echo "$value"; exit 3 ;;
+      unknown-unit) echo inactive; exit 3 ;;
+      malformed) echo nonsense; exit 0 ;;
+      timeout) exit 124 ;;
+      query-error) exit 1 ;;
+      permission) exit 1 ;;
+      *) echo "$value"; exit 9 ;;
+    esac
+    ;;
+  stop) bump_and_maybe_fail stop || exit 40; echo inactive > "$state" ;;
+  start) bump_and_maybe_fail start || exit 41; echo active > "$state" ;;
   *) exit 42 ;;
 esac
 SYSTEMCTL
@@ -374,6 +403,309 @@ test_backup_pointer_failure_restores_all_pointers() {
   done
 }
 
+backup_cmd() {
+  common_env "$backup" --output-dir "$RELEASES" --runtime-dir "$RUNTIME" --health-bin "$PREFIX/bin/openclaw" --yes
+}
+
+assert_runtime_identity() {
+  assert test "$(cat "$RUNTIME/exact-runtime-marker")" = "$ORIGINAL_MARKER" || return
+  assert test "$(runtime_tree_digest "$RUNTIME")" = "$ORIGINAL_RUNTIME_DIGEST" || return
+  assert test "$(stat -c '%d:%i' "$RUNTIME")" = "$ORIGINAL_RUNTIME_ID" || return
+  assert test "$(readlink "$PREFIX/bin/openclaw")" = "$ORIGINAL_BIN_TARGET" || return
+  assert test "$(readlink -f "$PREFIX/bin/openclaw")" = "$(readlink -f "$RUNTIME/openclaw.mjs")"
+}
+
+assert_lock_released() {
+  ( exec {check_fd}>"$RELEASES/.runtime.lock"; flock -n "$check_fd" )
+}
+
+assert_no_runtime_tx() {
+  assert test -z "$(find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -type d \( -name '.openclaw-install-tx.*' -o -name '.openclaw-rollback-tx.*' \) -print -quit)"
+}
+
+install_fake_corrupt_tar() {
+  local real_tar
+  real_tar="$(command -v tar)"
+  cat > "$FAKES/tar" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${FAKE_CORRUPT_TAR_LIST:-}" == package && " \$* " == *" -tzf "* ]]; then
+  printf 'package/package.json\\npackage/openclaw.mjs\\n'
+  exit 77
+fi
+if [[ "\${FAKE_CORRUPT_TAR_LIST:-}" == runtime && " \$* " == *" -tzf "* ]]; then
+  printf 'openclaw/package.json\\nopenclaw/openclaw.mjs\\n'
+  exit 77
+fi
+exec "$real_tar" "\$@"
+EOF
+  chmod +x "$FAKES/tar"
+}
+
+test_backup_health_binding_positive() {
+  setup_case active
+  local alias="$case_root/runtime-alias"
+  ln -s "$RUNTIME" "$alias"
+  common_env "$backup" --output-dir "$RELEASES" --runtime-dir "$alias" --health-bin "$PREFIX/bin/openclaw" --yes >/dev/null
+  assert test -L "$RELEASES/current-good.tgz" || return
+  local archived
+  archived="$(readlink -f "$RELEASES/current-good.tgz")"
+  assert test "$(tar -xOzf "$archived" openclaw/exact-runtime-marker)" = "$ORIGINAL_MARKER" || return
+  assert grep -Fxq 'probed_snapshot_entrypoint=openclaw/openclaw.mjs' "${archived}.manifest.txt" || return
+  assert_lock_released
+}
+
+test_backup_health_binding_mismatch() {
+  setup_case active
+  local runtime_b="$case_root/runtime-b" health_b="$case_root/health-b"
+  make_cli "$runtime_b" 8.0.0 unrelated-healthy-runtime
+  ln -s "$runtime_b/openclaw.mjs" "$health_b"
+  echo old > "$RELEASES/old"; ln -s old "$RELEASES/current-good.tgz"
+  local rc=0
+  common_env "$backup" --output-dir "$RELEASES" --runtime-dir "$RUNTIME" --health-bin "$health_b" --yes >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -ne 0 || return
+  assert_runtime_identity || return
+  assert test "$(readlink "$RELEASES/current-good.tgz")" = old || return
+  assert test -z "$(find "$RELEASES" -name 'openclaw-*.tgz' -print -quit)" || return
+  assert_lock_released
+}
+
+test_backup_health_alias_escape() {
+  setup_case active
+  local runtime_b="$case_root/runtime-b" alias_dir="$case_root/alias-dir"
+  make_cli "$runtime_b" 8.0.0 unrelated-healthy-runtime
+  mkdir "$alias_dir"
+  ln -s "$runtime_b/openclaw.mjs" "$alias_dir/openclaw"
+  if common_env "$backup" --output-dir "$RELEASES" --runtime-dir "$RUNTIME" --health-bin "$alias_dir/openclaw" --yes >/dev/null 2>&1; then return 1; fi
+  assert_runtime_identity || return
+  assert test ! -e "$RELEASES/current-good.tgz"
+}
+
+test_backup_rejects_source_mutation() {
+  setup_case active
+  local real_cp
+  real_cp="$(command -v cp)"
+  cat > "$FAKES/cp" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"$real_cp" "\$@"
+if [[ "\${FAKE_MUTATE_BACKUP_SOURCE:-}" == 1 && "\${*: -1}" == */snapshot/openclaw ]]; then
+  printf 'mutated-during-snapshot\\n' > "\${FAKE_MUTATE_SOURCE_PATH:?}/exact-runtime-marker"
+fi
+EOF
+  chmod +x "$FAKES/cp"
+  echo old > "$RELEASES/old"; ln -s old "$RELEASES/current-good.tgz"
+  local rc=0
+  FAKE_MUTATE_BACKUP_SOURCE=1 FAKE_MUTATE_SOURCE_PATH="$RUNTIME" backup_cmd >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -ne 0 || return
+  assert test "$(readlink "$RELEASES/current-good.tgz")" = old || return
+  assert test "$(cat "$RUNTIME/exact-runtime-marker")" = mutated-during-snapshot || return
+  assert test -z "$(find "$RELEASES" -name 'openclaw-*.tgz' -print -quit)"
+}
+
+test_service_state_fail_closed() {
+  local tool="$1" state="$2"
+  setup_case "$state"
+  local before rc=0
+  before="$(find "$RELEASES" -mindepth 1 ! -name .runtime.lock -printf '%P %y %l\n' | sort | sha256sum | awk '{print $1}')"
+  if [[ "$tool" == install ]]; then install_cmd >/dev/null 2>&1 || rc=$?; else rollback_cmd >/dev/null 2>&1 || rc=$?; fi
+  assert test "$rc" -ne 0 || return
+  assert_runtime_identity || return
+  assert test "$(cat "$SERVICE_STATE")" = "$state" || return
+  assert test "$before" = "$(find "$RELEASES" -mindepth 1 ! -name .runtime.lock -printf '%P %y %l\n' | sort | sha256sum | awk '{print $1}')" || return
+  assert_no_runtime_tx || return
+  assert_snapshot_staging_cleaned || return
+  assert_lock_released
+}
+
+test_action_failure_recovers() {
+  local tool="$1" action="$2"
+  setup_case active
+  local rc=0
+  if [[ "$action" == stop ]]; then
+    if [[ "$tool" == install ]]; then FAKE_SYSTEMCTL_FAIL_STOP_AT=1 install_cmd >/dev/null 2>&1 || rc=$?; else FAKE_SYSTEMCTL_FAIL_STOP_AT=1 rollback_cmd >/dev/null 2>&1 || rc=$?; fi
+  else
+    if [[ "$tool" == install ]]; then FAKE_SYSTEMCTL_FAIL_START_AT=1 install_cmd >/dev/null 2>&1 || rc=$?; else FAKE_SYSTEMCTL_FAIL_START_AT=1 rollback_cmd >/dev/null 2>&1 || rc=$?; fi
+  fi
+  assert test "$rc" -ne 0 || return
+  assert_original_restored active || return
+  assert test -n "$(find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -type d -name ".openclaw-${tool}-tx.*" -print -quit)" || return
+  assert_lock_released
+}
+
+test_recovery_start_failure_retains() {
+  local tool="$1"
+  setup_case active
+  local rc=0
+  if [[ "$tool" == install ]]; then
+    FAKE_UNHEALTHY_VERSION=2.0.0 FAKE_SYSTEMCTL_FAIL_START_AT=2 install_cmd >/dev/null 2>&1 || rc=$?
+  else
+    FAKE_UNHEALTHY_VERSION=0.9.0 FAKE_SYSTEMCTL_FAIL_START_AT=2 rollback_cmd >/dev/null 2>&1 || rc=$?
+  fi
+  assert test "$rc" -eq 3 || return
+  assert_runtime_identity || return
+  assert test "$(cat "$SERVICE_STATE")" = inactive || return
+  local tx
+  tx="$(find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -type d -name ".openclaw-${tool}-tx.*" -print -quit)"
+  if [[ -z "$tx" ]]; then find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -printf 'unexpected transaction entry: %f\n' >&2; fi
+  assert test -n "$tx" || return
+  assert test "$(stat -c %a "$tx")" = 700 || return
+  if [[ "$tool" == install ]]; then
+    assert test -n "$(find "$RELEASES" -name 'openclaw-*.tgz' -print -quit)" || return
+  else
+    assert test -f "$RESTORE_ARCHIVE" || return
+  fi
+  assert_lock_released
+}
+
+test_recovery_stop_failure_retains() {
+  local tool="$1"
+  setup_case active
+  local rc=0 expected_marker tx original_path
+  if [[ "$tool" == install ]]; then
+    expected_marker=candidate-exact
+    FAKE_UNHEALTHY_VERSION=2.0.0 FAKE_SYSTEMCTL_FAIL_STOP_AT=2 install_cmd >/dev/null 2>&1 || rc=$?
+    tx="$(find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-install-tx.*' -print -quit)"
+    original_path="$tx/previous-runtime"
+  else
+    expected_marker=known-good-exact
+    FAKE_UNHEALTHY_VERSION=0.9.0 FAKE_SYSTEMCTL_FAIL_STOP_AT=2 rollback_cmd >/dev/null 2>&1 || rc=$?
+    tx="$(find "$(dirname "$RUNTIME")" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-rollback-tx.*' -print -quit)"
+    original_path="$tx/replaced-runtime"
+  fi
+  assert test "$rc" -eq 3 || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert test "$(cat "$RUNTIME/exact-runtime-marker")" = "$expected_marker" || return
+  assert test -d "$original_path" || return
+  assert test "$(runtime_tree_digest "$original_path")" = "$ORIGINAL_RUNTIME_DIGEST" || return
+  assert test "$(stat -c '%d:%i' "$original_path")" = "$ORIGINAL_RUNTIME_ID" || return
+  assert test "$(stat -c %a "$tx")" = 700 || return
+  assert_lock_released
+}
+
+test_corrupt_partial_archive_list() {
+  local tool="$1"
+  setup_case active
+  install_fake_corrupt_tar
+  local rc=0
+  case "$tool" in
+    install) FAKE_CORRUPT_TAR_LIST=package install_cmd >/dev/null 2>&1 || rc=$? ;;
+    rollback) FAKE_CORRUPT_TAR_LIST=runtime rollback_cmd >/dev/null 2>&1 || rc=$? ;;
+    backup)
+      echo old > "$RELEASES/old"; ln -s old "$RELEASES/current-good.tgz"
+      FAKE_CORRUPT_TAR_LIST=runtime backup_cmd >/dev/null 2>&1 || rc=$?
+      ;;
+  esac
+  assert test "$rc" -ne 0 || return
+  assert_runtime_identity || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  if [[ "$tool" == backup ]]; then assert test "$(readlink "$RELEASES/current-good.tgz")" = old || return; fi
+  assert_lock_released
+}
+
+setup_pointer_baseline() {
+  echo symlink-old-bytes > "$RELEASES/old-runtime.tgz"
+  ln -s old-runtime.tgz "$RELEASES/current-good.tgz"
+  printf 'regular checksum pointer bytes\n' > "$RELEASES/current-good.tgz.sha256"
+  rm -f "$RELEASES/current-good.tgz.manifest.txt"
+}
+
+assert_pointer_baseline() {
+  assert test -L "$RELEASES/current-good.tgz" || return
+  assert test "$(readlink "$RELEASES/current-good.tgz")" = old-runtime.tgz || return
+  assert test -f "$RELEASES/current-good.tgz.sha256" || return
+  assert test ! -L "$RELEASES/current-good.tgz.sha256" || return
+  assert test "$(cat "$RELEASES/current-good.tgz.sha256")" = 'regular checksum pointer bytes' || return
+  assert test ! -e "$RELEASES/current-good.tgz.manifest.txt" || return
+}
+
+test_pointer_atomic_hook() {
+  local phase="$1" mode="$2"
+  setup_case active
+  setup_pointer_baseline
+  local rc=0
+  OPENCLAW_TEST_HOOK_PHASE="$phase" OPENCLAW_TEST_HOOK_MODE="$mode" backup_cmd >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -ne 0 || return
+  case "$mode" in INT) assert test "$rc" -eq 130 || return ;; TERM) assert test "$rc" -eq 143 || return ;; esac
+  assert_pointer_baseline || return
+  assert_runtime_identity || return
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert test -z "$(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-backup-tx.*' -print -quit)" || return
+  assert_lock_released
+}
+
+test_pointer_restore_failure_retains_journal() {
+  setup_case active
+  setup_pointer_baseline
+  local real_mv rc=0
+  real_mv="$(command -v mv)"
+  # Source operand is not position-stable because options precede it.
+  cat > "$FAKES/mv" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "\$@"; do
+  if [[ "\${FAKE_FAIL_POINTER_RESTORE:-}" == 1 && "\$arg" == */restore-* ]]; then exit 88; fi
+done
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$FAKES/mv"
+  FAKE_FAIL_POINTER_RESTORE=1 OPENCLAW_TEST_HOOK_PHASE=after-pointer-current-good.tgz OPENCLAW_TEST_HOOK_MODE=ERR \
+    backup_cmd >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -eq 3 || return
+  local tx="$RELEASES/$(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-backup-tx.*' -printf '%f\n' | head -1)"
+  assert test -d "$tx/pointers/old" || return
+  assert test -L "$tx/pointers/old/current-good.tgz" || return
+  assert test "$(readlink "$tx/pointers/old/current-good.tgz")" = old-runtime.tgz || return
+  assert test -f "$tx/pointers/old/current-good.tgz.sha256" || return
+  assert test -f "$tx/pointers/absent/current-good.tgz.manifest.txt" || return
+  assert_lock_released
+}
+
+test_pointer_repeated_signal_recovery() {
+  setup_case active
+  setup_pointer_baseline
+  local rc=0
+  OPENCLAW_TEST_RECOVERY_SIGNALS=repeated OPENCLAW_TEST_HOOK_PHASE=after-pointer-current-good.tgz \
+    OPENCLAW_TEST_HOOK_MODE=ERR backup_cmd >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -ne 0 || return
+  assert_pointer_baseline || return
+  assert test -z "$(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-backup-tx.*' -print -quit)"
+}
+
+test_pointer_post_commit_is_complete() {
+  setup_case active
+  setup_pointer_baseline
+  local rc=0
+  OPENCLAW_TEST_HOOK_PHASE=after-pointer-commit OPENCLAW_TEST_HOOK_MODE=ERR backup_cmd >/dev/null 2>&1 || rc=$?
+  assert test "$rc" -ne 0 || return
+  for name in current-good.tgz current-good.tgz.sha256 current-good.tgz.manifest.txt; do assert test -L "$RELEASES/$name" || return; done
+  assert test -f "$(readlink -f "$RELEASES/current-good.tgz")" || return
+  assert test -z "$(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.openclaw-backup-tx.*' -print -quit)"
+}
+
+test_collision_proof_transaction_paths() {
+  local tool="$1"
+  setup_case active
+  local parent="$(dirname "$RUNTIME")" collision
+  if [[ "$tool" == install ]]; then collision="$parent/openclaw.previous-20260923T000000Z-1"; else collision="$parent/openclaw.replaced-20260923T000000Z-1"; fi
+  mkdir -p "$collision/nested"; echo collision-sentinel > "$collision/nested/value"
+  if [[ "$tool" == install ]]; then install_cmd >/dev/null; else rollback_cmd >/dev/null; fi
+  assert test "$(cat "$collision/nested/value")" = collision-sentinel || return
+  local tx
+  tx="$(find "$parent" -mindepth 1 -maxdepth 1 -type d -name ".openclaw-${tool}-tx.*" -print -quit)"
+  assert test -n "$tx" || return
+  assert test "$(stat -c %a "$tx")" = 700 || return
+  if [[ "$tool" == install ]]; then
+    assert test -f "$tx/previous-runtime/exact-runtime-marker" || return
+    assert test ! -e "$tx/previous-runtime/openclaw" || return
+  else
+    assert test -f "$tx/replaced-runtime/exact-runtime-marker" || return
+    assert test ! -e "$tx/replaced-runtime/openclaw" || return
+  fi
+  assert test "$(cat "$SERVICE_STATE")" = active || return
+  assert_lock_released
+}
+
 run_case "dry run is non-mutating" test_dry_run
 run_case "running install succeeds with structured health" test_install_success_running
 run_case "stopped install stays stopped and preserves known-good" test_install_success_stopped_preserves_good
@@ -388,6 +720,34 @@ run_case "shared lock blocks installer and rollback" test_shared_lock_contention
 run_case "smoke test requires structured health schema" test_smoke_structured_health
 run_case "standalone backup refuses unhealthy baseline" test_backup_refuses_unhealthy_baseline
 run_case "pointer promotion failure restores all known-good pointers" test_backup_pointer_failure_restores_all_pointers
+run_case "standalone backup accepts canonical same-runtime health binding" test_backup_health_binding_positive
+run_case "standalone backup rejects runtime A health from runtime B" test_backup_health_binding_mismatch
+run_case "standalone backup rejects symlink alias escape to runtime B" test_backup_health_alias_escape
+run_case "standalone backup rejects source mutation during snapshot" test_backup_rejects_source_mutation
+for tool in install rollback; do
+  for state in failed activating deactivating unknown-unit malformed timeout query-error permission; do
+    run_case "$tool aborts before mutation for service state $state" test_service_state_fail_closed "$tool" "$state"
+  done
+  run_case "$tool stop failure recovers exact original" test_action_failure_recovers "$tool" stop
+  run_case "$tool start failure recovers exact original" test_action_failure_recovers "$tool" start
+  run_case "$tool recovery-start failure retains transaction" test_recovery_start_failure_retains "$tool"
+  run_case "$tool recovery-stop failure retains exact original material" test_recovery_stop_failure_retains "$tool"
+done
+for tool in install rollback backup; do
+  run_case "$tool rejects plausible partial archive list with producer failure" test_corrupt_partial_archive_list "$tool"
+done
+pointer_names_for_test=(current-good.tgz current-good.tgz.sha256 current-good.tgz.manifest.txt)
+for mode in ERR INT TERM EXIT; do
+  for pointer_name in "${pointer_names_for_test[@]}"; do
+    run_case "pointer transaction recovers $mode immediately before $pointer_name rename" test_pointer_atomic_hook "before-pointer-$pointer_name" "$mode"
+    run_case "pointer transaction recovers $mode immediately after $pointer_name rename" test_pointer_atomic_hook "after-pointer-$pointer_name" "$mode"
+  done
+done
+run_case "pointer restore failure is loud and retains complete journal" test_pointer_restore_failure_retains_journal
+run_case "repeated recovery signals are deterministic and nonrecursive" test_pointer_repeated_signal_recovery
+run_case "post-commit interruption leaves a complete pointer set" test_pointer_post_commit_is_complete
+run_case "installer transaction paths are private and collision-proof" test_collision_proof_transaction_paths install
+run_case "rollback transaction paths are private and collision-proof" test_collision_proof_transaction_paths rollback
 
 install_phases=(before-stop after-stop after-move-original after-activate-candidate after-link after-start after-health)
 rollback_phases=(before-stop after-stop after-move-original after-activate-restored after-link after-start after-health)

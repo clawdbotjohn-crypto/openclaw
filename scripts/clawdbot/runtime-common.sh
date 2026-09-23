@@ -11,6 +11,33 @@ runtime_canonical_path() {
   readlink -f -- "$1"
 }
 
+runtime_validate_owned_directory() {
+  local directory="$1" canonical owner mode
+  [[ -d "$directory" && ! -L "$directory" ]] || runtime_die "Required directory is missing or is a symlink: $directory" || return
+  canonical="$(readlink -f -- "$directory")" || runtime_die "Cannot canonicalize directory: $directory" || return
+  [[ "$canonical" == "$directory" ]] || runtime_die "Directory must be supplied by its canonical path: $directory" || return
+  owner="$(stat -c %u -- "$directory")"
+  [[ "$owner" == "$(id -u)" ]] || runtime_die "Directory is not owned by the current user: $directory" || return
+  mode="$(stat -c %a -- "$directory")"
+  # Group collaboration is permitted, but a transaction parent must never be
+  # writable by unrelated users. Exclusive 0700 children provide the boundary.
+  (( (8#$mode & 0002) == 0 )) || runtime_die "Transaction parent is writable by other users: $directory" || return
+}
+
+runtime_make_private_tx_dir() {
+  local parent="$1" prefix="$2" result
+  runtime_validate_owned_directory "$parent" || return
+  [[ "$prefix" =~ ^[A-Za-z0-9._-]+$ ]] || runtime_die "Invalid transaction prefix." || return
+  result="$(mktemp -d "$parent/.${prefix}.XXXXXX")" || runtime_die "Could not create private transaction directory in $parent" || return
+  chmod 700 "$result" || { rm -rf -- "$result"; return 1; }
+  [[ ! -L "$result" && "$(stat -c %u:%a -- "$result")" == "$(id -u):700" ]] || {
+    rm -rf -- "$result"
+    runtime_die "Private transaction directory validation failed."
+    return
+  }
+  printf '%s\n' "$result"
+}
+
 runtime_validate_checksum() {
   local archive="$1" checksum_file="$2"
   [[ -f "$checksum_file" ]] || runtime_die "Checksum file is required: $checksum_file" || return
@@ -63,6 +90,18 @@ runtime_validate_provenance() {
     runtime_die "Metadata package checksum mismatch." || return
 }
 
+runtime_archive_list() {
+  local archive="$1" output="$2"
+  [[ -f "$archive" ]] || runtime_die "Archive is missing: $archive" || return
+  [[ ! -e "$output" && ! -L "$output" ]] || runtime_die "Archive-list output already exists: $output" || return
+  ( umask 077; : > "$output" ) || return
+  if ! tar -tzf "$archive" > "$output"; then
+    echo "Archive listing failed: $archive" >&2
+    return 1
+  fi
+  [[ -s "$output" ]] || runtime_die "Archive is empty: $archive" || return
+}
+
 runtime_validate_health_json() {
   local file="$1" node_bin="${OPENCLAW_NODE_BIN:-node}"
   "$node_bin" - "$file" <<'NODE'
@@ -83,12 +122,46 @@ process.exit(valid ? 0 : 3);
 NODE
 }
 
-runtime_service_is_running() {
-  "$RUNTIME_SYSTEMCTL_BIN" --user is-active --quiet "$RUNTIME_SERVICE"
+# Tri-state service capture. Only an exact `active`/0 is running and only an
+# exact `inactive` (or compatibility `stopped`)/3 is stopped. failed,
+# activating, deactivating, unknown, malformed output, and all query errors are
+# unknown and must abort before mutation.
+runtime_capture_service_state() {
+  local load output load_rc rc
+  set +e
+  load="$("$RUNTIME_SYSTEMCTL_BIN" --user show --property=LoadState --value "$RUNTIME_SERVICE" 2>/dev/null)"
+  load_rc=$?
+  output="$("$RUNTIME_SYSTEMCTL_BIN" --user is-active "$RUNTIME_SERVICE" 2>/dev/null)"
+  rc=$?
+  set -e
+  load="${load%$'\n'}"
+  output="${output%$'\n'}"
+  # `is-active` alone is insufficient: systemd can report an unknown unit as
+  # `inactive`/3. Require a separate, exact LoadState=loaded proof.
+  if [[ "$load_rc" != 0 || "$load" != loaded ]]; then
+    RUNTIME_SERVICE_STATE=unknown
+    echo "Cannot prove loaded service $RUNTIME_SERVICE (status=$load_rc output=${load:-<empty>}); refusing mutation." >&2
+    return 1
+  fi
+  case "$rc:$output" in
+    0:active) RUNTIME_SERVICE_STATE=active; return 0 ;;
+    3:inactive|3:stopped) RUNTIME_SERVICE_STATE=inactive; return 0 ;;
+    *)
+      RUNTIME_SERVICE_STATE=unknown
+      echo "Cannot prove service state for $RUNTIME_SERVICE (status=$rc output=${output:-<empty>}); refusing mutation." >&2
+      return 1
+      ;;
+  esac
+}
+
+runtime_require_service_state() {
+  local expected="$1"
+  runtime_capture_service_state || return
+  [[ "$RUNTIME_SERVICE_STATE" == "$expected" ]] || runtime_die "Service state is '$RUNTIME_SERVICE_STATE', expected '$expected'." || return
 }
 
 runtime_structured_health_once() {
-  runtime_service_is_running || return 1
+  runtime_require_service_state active || return 1
   local output
   output="$(mktemp "${TMPDIR:-/tmp}/openclaw-health.XXXXXX")" || return 1
   if ! "$RUNTIME_HEALTH_BIN" health --json --timeout "$RUNTIME_HEALTH_TIMEOUT_MS" >"$output" 2>/dev/null; then
@@ -115,6 +188,41 @@ runtime_verify_active_path() {
   local runtime_dir="$1" bin_link="$2"
   [[ -f "$runtime_dir/package.json" && -f "$runtime_dir/openclaw.mjs" && -e "$bin_link" ]] || return 1
   [[ "$(readlink -f "$bin_link")" == "$(readlink -f "$runtime_dir/openclaw.mjs")" ]]
+}
+
+runtime_bind_health_to_runtime() {
+  local runtime_dir="$1" health_bin="$2" canonical_runtime canonical_entry canonical_health
+  canonical_runtime="$(readlink -f -- "$runtime_dir")" || runtime_die "Cannot canonicalize runtime: $runtime_dir" || return
+  [[ -d "$canonical_runtime" && ! -L "$canonical_runtime" ]] || runtime_die "Runtime is not a canonical directory: $runtime_dir" || return
+  canonical_entry="$(readlink -f -- "$canonical_runtime/openclaw.mjs")" || runtime_die "Runtime entrypoint is missing." || return
+  canonical_health="$(readlink -f -- "$health_bin")" || runtime_die "Health CLI cannot be canonicalized: $health_bin" || return
+  [[ "$canonical_entry" == "$canonical_runtime/openclaw.mjs" ]] || runtime_die "Runtime entrypoint escapes the runtime directory." || return
+  [[ "$canonical_health" == "$canonical_entry" ]] || runtime_die "Health CLI is not bound to the runtime being archived: $canonical_health != $canonical_entry" || return
+  [[ -x "$canonical_entry" ]] || runtime_die "Bound runtime health entrypoint is not executable." || return
+  RUNTIME_BOUND_ENTRYPOINT="$canonical_entry"
+}
+
+runtime_tree_digest() {
+  local directory="$1"
+  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -C "$directory" -cf - . | sha256sum | awk '{print $1}'
+}
+
+runtime_restore_service_state() {
+  local desired="$1"
+  runtime_capture_service_state || return 1
+  if [[ "$desired" == active ]]; then
+    if [[ "$RUNTIME_SERVICE_STATE" == inactive ]]; then
+      "$RUNTIME_SYSTEMCTL_BIN" --user start "$RUNTIME_SERVICE" || return 1
+      runtime_require_service_state active || return 1
+    fi
+    runtime_wait_for_structured_health
+  else
+    if [[ "$RUNTIME_SERVICE_STATE" == active ]]; then
+      "$RUNTIME_SYSTEMCTL_BIN" --user stop "$RUNTIME_SERVICE" || return 1
+      runtime_require_service_state inactive || return 1
+    fi
+    [[ "$RUNTIME_SERVICE_STATE" == inactive ]]
+  fi
 }
 
 runtime_acquire_lock() {
@@ -148,4 +256,12 @@ runtime_test_hook() {
     EXIT) exit 97 ;;
     *) runtime_die "Unknown test hook mode: $mode" ;;
   esac
+}
+
+runtime_test_repeated_recovery_signals() {
+  [[ "${OPENCLAW_TEST_RECOVERY_SIGNALS:-}" == repeated ]] || return 0
+  [[ "${OPENCLAW_TEST_MODE:-}" == 1 && "$(readlink -m "${OPENCLAW_TEST_ROOT:-/}")" == /tmp/* ]] ||
+    runtime_die "Refusing recovery signal hook outside explicit test mode." || return
+  kill -INT "$$"
+  kill -TERM "$$"
 }

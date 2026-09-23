@@ -9,18 +9,19 @@ usage() {
   cat <<'USAGE'
 Usage: backup-runtime.sh [options] --yes
 
-Archive the complete currently installed OpenClaw runtime. By default, the
-running service and structured `openclaw health --json` RPC must both be healthy
-before the validated archive atomically replaces current-good.tgz.
+Snapshot and archive the complete installed OpenClaw runtime. Promotable backup
+health is fail-closed: --health-bin must canonically resolve to that runtime's
+own openclaw.mjs, the private immutable snapshot is probed, and only that exact
+snapshot is archived. A CLI from another runtime can never promote pointers.
 
 Options:
   --output-dir DIR       Archive directory (default: ~/.openclaw/releases)
   --runtime-dir DIR      Installed OpenClaw directory (auto-detected)
   --service NAME         User service (default: openclaw-gateway.service)
-  --health-bin PATH      Active OpenClaw CLI (default: PREFIX/bin/openclaw)
+  --health-bin PATH      Active CLI symlink bound to RUNTIME/openclaw.mjs
   --no-promote-current-good
                          Create a pre-change archive but preserve known-good
-                         pointers (used when the prior service was stopped)
+                         pointers (used only for an explicitly stopped service)
   --yes                  Required acknowledgement
   -h, --help             Show this help
 USAGE
@@ -56,31 +57,37 @@ if [[ -z "$RUNTIME_DIR" ]]; then
   prefix="$(npm prefix --global)"
   RUNTIME_DIR="$prefix/lib/node_modules/openclaw"
 else
-  prefix="$(cd "$(dirname "$(dirname "$(dirname "$RUNTIME_DIR")")")" && pwd)"
+  RUNTIME_DIR="$(readlink -f -- "$RUNTIME_DIR")"
+  prefix="$(dirname "$(dirname "$(dirname "$RUNTIME_DIR")")")"
 fi
-RUNTIME_DIR="$(readlink -f "$RUNTIME_DIR")"
+RUNTIME_DIR="$(readlink -f -- "$RUNTIME_DIR")"
 RUNTIME_HEALTH_BIN="${RUNTIME_HEALTH_BIN:-$prefix/bin/openclaw}"
-[[ -d "$RUNTIME_DIR" && -f "$RUNTIME_DIR/package.json" && -f "$RUNTIME_DIR/openclaw.mjs" ]] || {
-  echo "Directory does not look like an OpenClaw runtime: $RUNTIME_DIR" >&2
+[[ -d "$RUNTIME_DIR" && ! -L "$RUNTIME_DIR" && -f "$RUNTIME_DIR/package.json" && -f "$RUNTIME_DIR/openclaw.mjs" ]] || {
+  echo "Directory does not look like a canonical OpenClaw runtime: $RUNTIME_DIR" >&2
   exit 1
 }
-[[ -x "$RUNTIME_HEALTH_BIN" ]] || { echo "Health CLI is not executable: $RUNTIME_HEALTH_BIN" >&2; exit 1; }
 [[ "$RUNTIME_HEALTH_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid health timeout." >&2; exit 2; }
+runtime_bind_health_to_runtime "$RUNTIME_DIR" "$RUNTIME_HEALTH_BIN"
+source_health_bin="$RUNTIME_HEALTH_BIN"
 
 mkdir -p "$OUTPUT_DIR"
-OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+runtime_validate_owned_directory "$OUTPUT_DIR"
 runtime_acquire_lock "$OUTPUT_DIR/.runtime.lock" "$LOCK_FD"
-
-if $PROMOTE; then
-  runtime_structured_health_once || {
-    echo "Baseline is not proven healthy by the structured CLI/RPC probe; preserving current-good pointers." >&2
-    exit 1
-  }
+runtime_capture_service_state
+initial_service_state="$RUNTIME_SERVICE_STATE"
+if $PROMOTE && [[ "$initial_service_state" != active ]]; then
+  echo "Promotable backup requires an explicitly active service; preserving current-good pointers." >&2
+  exit 1
+fi
+if ! $PROMOTE && [[ "$initial_service_state" != inactive ]]; then
+  echo "Non-promotable stopped-state backup requires an explicitly inactive service." >&2
+  exit 1
 fi
 
 runtime_bytes="$(du -sb "$RUNTIME_DIR" | awk '{print $1}')"
 available_bytes="$(df -PB1 "$OUTPUT_DIR" | awk 'NR==2 {print $4}')"
-required_bytes=$((runtime_bytes * 2))
+required_bytes=$((runtime_bytes * 3))
 if (( available_bytes < required_bytes )); then
   echo "Insufficient free space: need at least $required_bytes bytes; have $available_bytes." >&2
   exit 1
@@ -88,49 +95,131 @@ fi
 
 version="$(node -e 'const p=require(process.argv[1]); process.stdout.write(String(p.version||"unknown"))' "$RUNTIME_DIR/package.json")"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-archive="$OUTPUT_DIR/openclaw-${version}-${timestamp}-$$.tgz"
-partial="${archive}.partial"
+tx_dir="$(runtime_make_private_tx_dir "$OUTPUT_DIR" openclaw-backup-tx)"
+script_pid="$BASHPID"
+archive=""; checksum=""; manifest=""
+trap 'rc=$?; if [[ "$BASHPID" == "$script_pid" && "$rc" != 0 ]]; then rm -rf -- "$tx_dir"; [[ -z "$archive" ]] || rm -f -- "$archive" "$checksum" "$manifest"; fi' EXIT
+snapshot_parent="$tx_dir/snapshot"
+snapshot_runtime="$snapshot_parent/openclaw"
+mkdir -m 700 "$snapshot_parent"
+source_digest_before="$(runtime_tree_digest "$RUNTIME_DIR")"
+cp -a -- "$RUNTIME_DIR" "$snapshot_runtime"
+runtime_test_hook after-runtime-snapshot
+source_digest_after="$(runtime_tree_digest "$RUNTIME_DIR")"
+snapshot_digest_before="$(runtime_tree_digest "$snapshot_runtime")"
+[[ "$source_digest_before" == "$source_digest_after" && "$source_digest_before" == "$snapshot_digest_before" ]] || {
+  echo "Runtime changed while its private snapshot was captured; refusing backup." >&2
+  rm -rf -- "$tx_dir"
+  exit 1
+}
+
+# The executable actually probed is inside the immutable tree that will be archived.
+RUNTIME_HEALTH_BIN="$snapshot_runtime/openclaw.mjs"
+if $PROMOTE; then
+  runtime_structured_health_once || {
+    echo "Snapshot is not proven healthy by its bound structured CLI/RPC probe; preserving current-good pointers." >&2
+    rm -rf -- "$tx_dir"
+    exit 1
+  }
+fi
+snapshot_digest_after_health="$(runtime_tree_digest "$snapshot_runtime")"
+[[ "$snapshot_digest_before" == "$snapshot_digest_after_health" ]] || {
+  echo "Runtime snapshot mutated during health validation; refusing backup." >&2
+  rm -rf -- "$tx_dir"
+  exit 1
+}
+
+archive="$(mktemp "$OUTPUT_DIR/openclaw-${version}-${timestamp}.XXXXXX.tgz")"
+chmod 600 "$archive"
+partial="$tx_dir/archive.partial"
 checksum="${archive}.sha256"
 manifest="${archive}.manifest.txt"
-runtime_parent="$(dirname "$RUNTIME_DIR")"
-runtime_name="$(basename "$RUNTIME_DIR")"
-pointer_tx_active=false
+list_file="$tx_dir/archive.list"
+pointer_dir="$tx_dir/pointers"
 pointer_names=(current-good.tgz current-good.tgz.sha256 current-good.tgz.manifest.txt)
-pointer_installed=()
-pointer_temps=()
-cleanup() {
-  local name old installed temp
-  rm -f "$partial" 2>/dev/null || true
-  if $pointer_tx_active; then
-    for name in "${pointer_names[@]}"; do
-      old="$OUTPUT_DIR/.${name}.pointer-old.$$"
-      if [[ -e "$old" || -L "$old" ]]; then
-        mv -Tf "$old" "$OUTPUT_DIR/$name" || true
-      else
-        for installed in "${pointer_installed[@]:-}"; do
-          [[ "$installed" == "$name" ]] && rm -f "$OUTPUT_DIR/$name"
-        done
-      fi
-    done
-  fi
-  for temp in "${pointer_temps[@]:-}"; do [[ -n "$temp" ]] && rm -f "$temp"; done
-  for name in "${pointer_names[@]}"; do rm -f "$OUTPUT_DIR/.${name}.pointer-old.$$"; done
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+pointer_targets=("$(basename "$archive")" "$(basename "$checksum")" "$(basename "$manifest")")
+pointer_tx_active=false
+recovering=false
 
-echo "Archiving $RUNTIME_DIR ($runtime_bytes bytes)..."
-tar -C "$runtime_parent" -czf "$partial" "$runtime_name"
-mv "$partial" "$archive"
-(cd "$OUTPUT_DIR" && sha256sum "$(basename "$archive")" > "$(basename "$checksum")")
+pointer_matches_new() {
+  local index="$1" link="$OUTPUT_DIR/${pointer_names[$index]}"
+  [[ -L "$link" && "$(readlink "$link")" == "${pointer_targets[$index]}" ]]
+}
+restore_pointers() {
+  local index name link old temp ok=true
+  $recovering && return 1
+  recovering=true
+  trap - ERR EXIT
+  trap '' INT TERM
+  runtime_test_repeated_recovery_signals || true
+  echo "Recovering known-good pointers from transaction journal: $pointer_dir" >&2
+  for index in "${!pointer_names[@]}"; do
+    name="${pointer_names[$index]}"
+    link="$OUTPUT_DIR/$name"
+    old="$pointer_dir/old/$name"
+    runtime_test_hook "before-pointer-restore-$name" || ok=false
+    if [[ -e "$old" || -L "$old" ]]; then
+      temp="$pointer_dir/restore-$index"
+      rm -f -- "$temp"
+      cp -a --no-dereference "$old" "$temp" || { ok=false; continue; }
+      mv -Tf -- "$temp" "$link" || { ok=false; continue; }
+      if [[ -L "$old" ]]; then
+        [[ -L "$link" && "$(readlink "$link")" == "$(readlink "$old")" ]] || ok=false
+      elif [[ -f "$old" ]]; then
+        [[ -f "$link" && ! -L "$link" ]] && cmp -s -- "$old" "$link" || ok=false
+      else
+        ok=false
+      fi
+    elif [[ -f "$pointer_dir/absent/$name" ]]; then
+      rm -f -- "$link" || ok=false
+      [[ ! -e "$link" && ! -L "$link" ]] || ok=false
+    else
+      ok=false
+    fi
+    runtime_test_hook "after-pointer-restore-$name" || ok=false
+  done
+  $ok
+}
+finish_or_recover_pointer_tx() {
+  local source="$1" rc="$2" ok=true
+  [[ "$BASHPID" == "$script_pid" ]] || return 0
+  trap - ERR INT TERM EXIT
+  trap '' INT TERM
+  if $pointer_tx_active; then
+    if [[ -f "$pointer_dir/committed" ]]; then
+      local index
+      for index in "${!pointer_names[@]}"; do pointer_matches_new "$index" || ok=false; done
+    else
+      restore_pointers || ok=false
+    fi
+  fi
+  if ! $ok; then
+    echo "CRITICAL: known-good pointer recovery/verification failed. Recovery journal and copies retained at: $tx_dir" >&2
+    exit 3
+  fi
+  rm -rf -- "$tx_dir"
+  case "$source" in INT) exit 130 ;; TERM) exit 143 ;; EXIT) exit "$rc" ;; *) exit "$rc" ;; esac
+}
+echo "Archiving private snapshot of $RUNTIME_DIR ($runtime_bytes bytes)..."
+tar -C "$snapshot_parent" -czf "$partial" openclaw
+snapshot_digest_after_tar="$(runtime_tree_digest "$snapshot_runtime")"
+[[ "$snapshot_digest_before" == "$snapshot_digest_after_tar" ]] || { echo "Runtime snapshot mutated while archived." >&2; false; }
+mv -Tf -- "$partial" "$archive"
+( umask 077; cd "$OUTPUT_DIR" && sha256sum "$(basename "$archive")" > "$(basename "$checksum")" )
 runtime_validate_checksum "$archive" "$checksum"
-tar -tzf "$archive" >/dev/null
+runtime_archive_list "$archive" "$list_file"
+grep -Fxq 'openclaw/package.json' "$list_file" && grep -Fxq 'openclaw/openclaw.mjs' "$list_file" || {
+  echo "Validated archive is missing required runtime entries." >&2
+  false
+}
 {
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "hostname=$(hostname)"
   echo "openclaw_version=$version"
   echo "source_runtime=$RUNTIME_DIR"
+  echo "bound_health_source=$(readlink -f -- "$source_health_bin")"
+  echo "probed_snapshot_entrypoint=openclaw/openclaw.mjs"
+  echo "snapshot_tree_sha256=$snapshot_digest_before"
   echo "archive=$archive"
   echo "archive_bytes=$(stat -c %s "$archive")"
   echo "archive_sha256=$RUNTIME_VALIDATED_SHA256"
@@ -138,34 +227,42 @@ tar -tzf "$archive" >/dev/null
   echo "npm=$(npm --version)"
   echo "known_good_promoted=$PROMOTE"
 } > "$manifest"
+chmod 600 "$checksum" "$manifest"
 
 if $PROMOTE; then
-  pointer_targets=("$(basename "$archive")" "$(basename "$checksum")" "$(basename "$manifest")")
+  trap 'finish_or_recover_pointer_tx ERR $?' ERR
+  trap 'finish_or_recover_pointer_tx INT 130' INT
+  trap 'finish_or_recover_pointer_tx TERM 143' TERM
+  trap 'rc=$?; finish_or_recover_pointer_tx EXIT "$rc"' EXIT
+  mkdir -m 700 "$pointer_dir" "$pointer_dir/old" "$pointer_dir/absent" "$pointer_dir/new"
   for index in "${!pointer_names[@]}"; do
-    temp="$OUTPUT_DIR/.${pointer_names[$index]}.$RANDOM.$$"
-    ln -s "${pointer_targets[$index]}" "$temp"
-    pointer_temps+=("$temp")
-  done
-  for index in "${!pointer_names[@]}"; do
-    link="$OUTPUT_DIR/${pointer_names[$index]}"
-    old="$OUTPUT_DIR/.${pointer_names[$index]}.pointer-old.$$"
-    if [[ -e "$link" || -L "$link" ]]; then cp -a --no-dereference "$link" "$old"; fi
+    name="${pointer_names[$index]}"
+    link="$OUTPUT_DIR/$name"
+    if [[ -e "$link" || -L "$link" ]]; then
+      cp -a --no-dereference "$link" "$pointer_dir/old/$name"
+    else
+      : > "$pointer_dir/absent/$name"
+    fi
+    ln -s "${pointer_targets[$index]}" "$pointer_dir/new/$name"
   done
   pointer_tx_active=true
   runtime_test_hook before-pointer-promotion
   for index in "${!pointer_names[@]}"; do
-    link="$OUTPUT_DIR/${pointer_names[$index]}"
-    mv -Tf "${pointer_temps[$index]}" "$link"
-    pointer_installed+=("${pointer_names[$index]}")
-    runtime_test_hook "after-pointer-${pointer_names[$index]}"
+    name="${pointer_names[$index]}"
+    runtime_test_hook "before-pointer-$name"
+    mv -Tf -- "$pointer_dir/new/$name" "$OUTPUT_DIR/$name"
+    runtime_test_hook "after-pointer-$name"
   done
+  for index in "${!pointer_names[@]}"; do pointer_matches_new "$index"; done
+  ( umask 077; : > "$pointer_dir/committed" )
+  runtime_test_hook after-pointer-commit
   pointer_tx_active=false
-  for name in "${pointer_names[@]}"; do rm -f "$OUTPUT_DIR/.${name}.pointer-old.$$"; done
-  echo "Known-good pointers updated after structured baseline health and archive validation."
+  echo "Known-good pointers updated after bound snapshot health and archive validation."
 else
-  echo "Known-good pointers preserved because the prior service was stopped."
+  echo "Known-good pointers preserved because the prior service was explicitly stopped."
 fi
-trap - EXIT INT TERM
 
+trap - ERR INT TERM EXIT
+rm -rf -- "$tx_dir"
 echo "Backup complete: $archive"
 echo "Checksum: $RUNTIME_VALIDATED_SHA256"
