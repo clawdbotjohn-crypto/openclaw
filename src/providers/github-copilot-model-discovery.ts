@@ -9,6 +9,12 @@ const REQUEST_TIMEOUT_MS = 8_000;
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 const PROVIDER = "github-copilot";
+const COPILOT_CLIENT_HEADERS = {
+  "User-Agent": "GitHubCopilotChat/0.35.0",
+  "Editor-Version": "vscode/1.107.0",
+  "Editor-Plugin-Version": "copilot-chat/0.35.0",
+  "Copilot-Integration-Id": "vscode-chat",
+} as const;
 
 type JsonObject = Record<string, unknown>;
 export type CopilotDiscoveryResult =
@@ -152,6 +158,9 @@ export function normalizeGitHubCopilotModelsResponse(
       api,
       provider: PROVIDER,
       baseUrl,
+      // IDE-authenticated Copilot endpoints require the client identity on
+      // inference requests as well as on /models discovery.
+      headers: { ...COPILOT_CLIENT_HEADERS },
       reasoning: Array.isArray(reasoningEffort) && reasoningEffort.length > 0,
       input: vision === true ? ["text", "image"] : ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -212,7 +221,11 @@ export async function discoverGitHubCopilotModels(params: {
     try {
       const response = await (params.fetchImpl ?? fetch)(`${baseUrl}/models`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${exchanged.token}`, Accept: "application/json" },
+        headers: {
+          Authorization: `Bearer ${exchanged.token}`,
+          Accept: "application/json",
+          ...COPILOT_CLIENT_HEADERS,
+        },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!response.ok) {

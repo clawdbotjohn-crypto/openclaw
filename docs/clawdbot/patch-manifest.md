@@ -47,8 +47,10 @@ API base URL returned by that exchange. Account-visible, picker-enabled chat mod
 tool-call support are normalized in memory and shared by the model catalog, `models list`, and
 runtime resolution. The 30-second process cache is isolated by a hash of the source account token
 and normalized base URL, coalesces concurrent requests, and retains the last successful snapshot
-on transient failures. A successful 200 response is authoritative, including an empty/removal
-response. Short-lived bearers and discovered definitions are never written to config or
+on transient failures. Requests identify as the same pinned VS Code Copilot Chat client used by
+pi-ai (`User-Agent`, editor/plugin version, and integration ID) for both discovery and inference;
+the real endpoint returns HTTP 400 without those compatibility headers. A successful 200 response is authoritative, including an
+empty/removal response. Short-lived bearers and discovered definitions are never written to config or
 `models.json`; `agents.defaults.models` remains an operator allowlist.
 
 **Upstream references:** semantic backport of OpenClaw commit
@@ -77,6 +79,47 @@ release containing authenticated Copilot provider-catalog discovery plus runtime
 and equivalent account isolation, stale/error semantics, removal behavior, and focused tests pass
 without the downstream shim.
 
+### Staged candidate installer and portable build checksum
+
+**Downstream implementation:** `scripts/clawdbot/install-candidate.sh` fails closed on an exact,
+single-record tarball checksum and exact `build-metadata.txt` repository/promotable branch ref/
+post-merge SHA/push event/tarball checksum. Pull refs and PR artifacts are not promotable. It
+copies the artifact, checksum, and provenance into a private transaction-owned snapshot, validates
+that snapshot's package shape and isolated CLI execution, and passes only the snapshot to npm. The
+same runtime lock is shared with backup and manual rollback; rollback likewise validates, lists, and
+extracts only a private archive snapshot. Archive listing is captured to a private file and its producer
+exit status must succeed before any entry is trusted. Service state is tri-state and fail-closed: an exact
+`LoadState=loaded` proof plus exact `active`/0 or `inactive`/3 is required; failed, transitioning,
+unknown, malformed, timeout, permission, and query-error states abort before mutation.
+
+Promotable backup health is cryptographically/tree bound rather than caller-asserted: the supplied CLI
+must canonically resolve to the selected runtime's own entrypoint, a stable private snapshot is made,
+the executable inside that exact snapshot performs parsed `openclaw health --json` WebSocket RPC,
+and pre/post tree digests reject mutation before that tree is archived. Known-good promotion uses a
+private journal, exact copies of every old pointer type/absence, atomic renames, and an atomic commit
+marker. Pre-commit ERR/INT/TERM/EXIT recovery is reconciled from filesystem/journal state; restore
+failure retains the complete journal and fails loudly. Installer and rollback use exclusive 0700
+transaction directories for staged/previous/failed/recovery paths and retain recovery material when
+service stop/start restoration cannot be proven. The installer is validation-only by default; mutation
+requires `--apply --yes`, and the active global target also requires `--allow-live-runtime`. Promotion
+remains post-merge.
+
+**Tests:** `scripts/clawdbot/tests/install-candidate.test.sh` runs 197 isolated fake-environment
+cases: every applicable running and stopped installer/rollback mutation boundary crossed with
+ERR/INT/TERM/EXIT; exact runtime content/inode/path, pointer bytes/link/absence, lock, and service
+state assertions; active/inactive and every fail-closed service-state class; stop/start and
+recovery-stop/recovery-start failure; same-runtime and A-vs-B health binding, aliases, symlink escape,
+and source mutation; private collision-proof transactions and unsafe temporary-parent rejection; producer-failing plausible archive lists;
+and immediately-before/immediately-after every pointer rename, restore failure, repeated recovery
+signals, and post-commit reconciliation. Checksum/provenance and structured-health gates remain
+covered. Fake `systemctl`, npm, CLI, archive tools, and `/tmp` directories prevent tests from reaching
+live state.
+
+**Rollback:** revert the installer/workflow commit. This does not alter package runtime behavior,
+config schema, or user state. For an operational outage, use only the independent transactional
+`rollback-runtime.sh` owner route in `EMERGENCY-RECOVERY.md`; never perform manual package
+replacement.
+
 ## Historical patches requiring re-verification
 
 These patches solved real problems, but their need and implementation must be checked
@@ -101,7 +144,9 @@ Catalog recognition and request compatibility are separate. Adding a model ID do
 necessarily implement its required reasoning/request format. In particular, newer
 Anthropic models may require adaptive thinking rather than legacy budget-style
 `thinking.type=enabled`. Every model port needs basic tool-call and configured-reasoning
-probes before it is used in routing.
+probes before it is used in routing. The pinned pi-ai 0.55.3 handling and exact Claude Opus 4.8
+follow-up are documented in `claude-adaptive-thinking-follow-up.md`; it is separate from and does
+not block the OpenAI-responses-based Sol promotion.
 
 ## Update rule
 
