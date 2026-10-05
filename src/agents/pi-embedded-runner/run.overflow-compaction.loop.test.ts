@@ -309,6 +309,30 @@ describe("overflow compaction in run loop", () => {
     expect(result.payloads?.[0]?.text).toContain("timed out");
   });
 
+  it("fails closed on compaction timeout instead of replaying stale assistant text", async () => {
+    const staleAssistantText = "previous successful answer";
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        aborted: true,
+        timedOut: true,
+        timedOutDuringCompaction: true,
+        assistantTexts: [],
+        lastAssistant: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: staleAssistantText,
+        } as unknown as EmbeddedRunAttemptResult["lastAssistant"],
+      }),
+    );
+
+    const result = await runEmbeddedPiAgent(baseParams);
+    const firstPayloadText = result.payloads?.[0]?.text ?? "";
+
+    expect(result.payloads?.[0]?.isError).toBe(true);
+    expect(firstPayloadText).toContain("compaction timed out");
+    expect(firstPayloadText).not.toContain(staleAssistantText);
+  });
+
   it("sets promptTokens from the latest model call usage, not accumulated attempt usage", async () => {
     mockedRunEmbeddedAttempt.mockResolvedValue(
       makeAttemptResult({
