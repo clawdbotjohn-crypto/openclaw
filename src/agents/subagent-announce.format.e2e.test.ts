@@ -618,6 +618,76 @@ describe("subagent announce formatting", () => {
     );
   });
 
+  it("delivers cron completion while child descendant announces are still pending", async () => {
+    sessionStore = {
+      "agent:main:subagent:test": {
+        sessionId: "child-session-cron",
+      },
+      "agent:main:cron:job-123": {
+        sessionId: "requester-session-cron",
+      },
+    };
+    chatHistoryMock.mockResolvedValueOnce({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "cron final answer" }] }],
+    });
+    subagentRegistryMock.countPendingDescendantRuns.mockImplementation((sessionKey: string) =>
+      sessionKey === "agent:main:subagent:test" ? 7 : 0,
+    );
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-direct-cron-child-pending",
+      requesterSessionKey: "agent:main:cron:job-123",
+      requesterDisplayKey: "cron:job-123",
+      requesterOrigin: { channel: "discord", to: "channel:12345", accountId: "acct-1" },
+      ...defaultOutcomeAnnounce,
+      announceType: "cron job",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(agentSpy).not.toHaveBeenCalled();
+  });
+
+  it("delivers cron completion while requester descendant announces are still pending", async () => {
+    sessionStore = {
+      "agent:main:subagent:test": {
+        sessionId: "child-session-cron",
+      },
+      "agent:main:cron:job-123": {
+        sessionId: "requester-session-cron",
+      },
+    };
+    chatHistoryMock.mockResolvedValueOnce({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "cron final answer" }] }],
+    });
+    subagentRegistryMock.countPendingDescendantRuns.mockImplementation((sessionKey: string) =>
+      sessionKey === "agent:main:cron:job-123" ? 7 : 0,
+    );
+    subagentRegistryMock.countPendingDescendantRunsExcludingRun.mockImplementation(
+      (sessionKey: string, runId: string) =>
+        sessionKey === "agent:main:cron:job-123" && runId === "run-direct-cron-requester-pending"
+          ? 6
+          : 0,
+    );
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-direct-cron-requester-pending",
+      requesterSessionKey: "agent:main:cron:job-123",
+      requesterDisplayKey: "cron:job-123",
+      requesterOrigin: { channel: "discord", to: "channel:12345", accountId: "acct-1" },
+      ...defaultOutcomeAnnounce,
+      announceType: "cron job",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(agentSpy).not.toHaveBeenCalled();
+  });
+
   it("keeps session-mode completion delivery on the bound destination when sibling runs are active", async () => {
     sessionStore = {
       "agent:main:subagent:test": {

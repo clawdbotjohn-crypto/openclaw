@@ -48,11 +48,13 @@ export async function runTelegramAnnounceTurn(params: {
   home: string;
   storePath: string;
   deps: CliDeps;
+  deleteAfterRun?: boolean;
   delivery: {
     mode: "announce";
     channel: string;
     to?: string;
     bestEffort?: boolean;
+    accountId?: string;
   };
 }): Promise<Awaited<ReturnType<typeof runCronIsolatedAgentTurn>>> {
   return runCronIsolatedAgentTurn({
@@ -63,6 +65,7 @@ export async function runTelegramAnnounceTurn(params: {
     job: {
       ...makeJob({ kind: "agentTurn", message: "do it" }),
       delivery: params.delivery,
+      ...(params.deleteAfterRun === undefined ? {} : { deleteAfterRun: params.deleteAfterRun }),
     },
     message: "do it",
     sessionKey: "cron:job-1",
